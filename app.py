@@ -1,151 +1,14 @@
 
-import io
 import re
-import sqlite3
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
+from supabase import create_client
 
-DB_PATH = Path(__file__).with_name("personale.db")
-
-st.set_page_config(
-    page_title="La Cambusa - Gestione Personale",
-    page_icon="👥",
-    layout="wide",
-)
-
-# -------------------- DATABASE --------------------
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-def init_db():
-    conn = get_conn()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            name TEXT NOT NULL,
-            role TEXT,
-            level TEXT,
-            department TEXT DEFAULT 'Da assegnare',
-            hire_date TEXT,
-            active INTEGER DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS monthly_costs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            year INTEGER NOT NULL,
-            month INTEGER NOT NULL,
-            gross_pay REAL DEFAULT 0,
-            social_charges REAL DEFAULT 0,
-            other_charges REAL DEFAULT 0,
-            tfr REAL DEFAULT 0,
-            inail REAL DEFAULT 0,
-            company_cost REAL DEFAULT 0,
-            net_pay REAL DEFAULT 0,
-            hours REAL DEFAULT 0,
-            source_file TEXT,
-            UNIQUE(employee_id, year, month),
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS fringe_benefits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            benefit_date TEXT NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT,
-            note TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS extra_payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            payment_date TEXT NOT NULL,
-            amount REAL NOT NULL,
-            reason TEXT NOT NULL,
-            payment_method TEXT DEFAULT 'Da regolarizzare',
-            regularized INTEGER DEFAULT 0,
-            note TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS monthly_revenue (
-            year INTEGER NOT NULL,
-            month INTEGER NOT NULL,
-            revenue REAL DEFAULT 0,
-            covers INTEGER DEFAULT 0,
-            PRIMARY KEY(year, month)
-        );
-
-        CREATE TABLE IF NOT EXISTS employee_profiles (
-            employee_id INTEGER PRIMARY KEY,
-            phone TEXT,
-            email TEXT,
-            tax_code TEXT,
-            iban TEXT,
-            address TEXT,
-            contract_type TEXT,
-            contract_end TEXT,
-            weekly_hours REAL DEFAULT 0,
-            emergency_contact TEXT,
-            notes TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS employee_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            event_date TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            details TEXT,
-            amount REAL DEFAULT 0,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS employee_documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            document_type TEXT NOT NULL,
-            file_name TEXT,
-            issue_date TEXT,
-            expiry_date TEXT,
-            status TEXT DEFAULT 'Valido',
-            note TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS employee_ratings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            rating_date TEXT NOT NULL,
-            punctuality INTEGER DEFAULT 0,
-            professionalism INTEGER DEFAULT 0,
-            sales INTEGER DEFAULT 0,
-            flexibility INTEGER DEFAULT 0,
-            teamwork INTEGER DEFAULT 0,
-            leadership INTEGER DEFAULT 0,
-            note TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        );
-        """
-    )
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# -------------------- HELPERS --------------------
+st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
 
 MONTHS = {
     1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile",
@@ -154,729 +17,405 @@ MONTHS = {
 }
 
 def euro(v):
+    v = float(v or 0)
     return f"€ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def parse_it_number(s):
-    if s is None:
+def parse_it_number(value):
+    if not value:
         return 0.0
-    s = s.strip().replace(".", "").replace(",", ".")
+    value = value.strip().replace(".", "").replace(",", ".")
     try:
-        return float(s)
+        return float(value)
     except ValueError:
         return 0.0
 
-def pdf_to_text(uploaded):
-    reader = PdfReader(uploaded)
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+@st.cache_resource
+def supabase():
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["secret_key"]
+    except Exception:
+        st.error(
+            "Supabase non è configurato. Apri Manage app → Settings → Secrets "
+            "e inserisci url e secret_key."
+        )
+        st.stop()
+    return create_client(url, key)
 
-def parse_period(text):
-    m = re.search(r"periodo da\s+(\d{2})/(\d{4})\s+a\s+\d{2}/\d{4}", text, re.I)
-    if not m:
-        return None, None
-    return int(m.group(2)), int(m.group(1))
+sb = supabase()
 
-def parse_total_company(text):
-    m = re.search(r"Totale ditta:\s*([\d\.,]+)", text, re.I)
-    return parse_it_number(m.group(1)) if m else 0.0
+def employees_df():
+    data = (
+        sb.table("employees")
+        .select("id,code,name,department,role,level,active")
+        .order("name")
+        .execute()
+        .data or []
+    )
+    return pd.DataFrame(data)
 
-def extract_value(block, label):
+def pdf_text(uploaded):
+    reader = PdfReader(BytesIO(uploaded.getvalue()))
+    return "\n".join((p.extract_text() or "") for p in reader.pages)
+
+def find_amount(block, label):
     m = re.search(rf"{re.escape(label)}\s+([\d\.,-]+)", block, re.I)
     return parse_it_number(m.group(1)) if m else 0.0
 
-def parse_employee_costs(text):
-    # Split on each employee section.
-    pieces = re.split(r"(?=Dipendente\s*:\s*\d+)", text, flags=re.I)
-    rows = []
-    for block in pieces:
-        head = re.search(r"Dipendente\s*:\s*(\d+)\s+([^\n]+)", block, re.I)
-        if not head:
-            continue
-        code = head.group(1).strip()
-        name = head.group(2).strip()
-        # Stop accidental carry-over at next headings.
-        name = re.sub(r"\s{2,}.*$", "", name)
-        total_matches = re.findall(r"Totale dipendente:\s*([\d\.,]+)", block, re.I)
-        if not total_matches:
-            continue
-        total = parse_it_number(total_matches[-1])
-        gross = extract_value(block, "Retribuzioni lorde")
-        social = extract_value(block, "Oneri sociali")
-        other = extract_value(block, "Altri oneri")
-        inail = extract_value(block, "INAIL")
-        tfr = (
-            extract_value(block, "TFR esercizio")
-            + extract_value(block, "TFR erogato")
-            + extract_value(block, "TFR previdenza complementare")
-        )
-        rows.append({
-            "code": code,
-            "name": name,
-            "gross_pay": gross,
-            "social_charges": social,
-            "other_charges": other,
-            "tfr": tfr,
-            "inail": inail,
-            "company_cost": total,
-        })
-    return rows
+def parse_cost_report(text):
+    pm = re.search(r"periodo da\s+(\d{2})/(\d{4})\s+a\s+\d{2}/\d{4}", text, re.I)
+    if not pm:
+        raise ValueError("Periodo non riconosciuto.")
+    year, month = int(pm.group(2)), int(pm.group(1))
 
-def upsert_employee(conn, code, name):
-    conn.execute(
-        """
-        INSERT INTO employees(code, name)
-        VALUES(?, ?)
-        ON CONFLICT(code) DO UPDATE SET name=excluded.name
-        """,
-        (code, name),
-    )
-    return conn.execute("SELECT id FROM employees WHERE code=?", (code,)).fetchone()[0]
+    sections = re.split(r"(?=Dipendente\s*:\s*\d+)", text, flags=re.I)
+    parsed = []
+    for block in sections:
+        h = re.search(r"Dipendente\s*:\s*(\d+)\s+([^\n]+)", block, re.I)
+        totals = re.findall(r"Totale dipendente:\s*([\d\.,]+)", block, re.I)
+        if not h or not totals:
+            continue
+        parsed.append({
+            "code": h.group(1).strip(),
+            "name": re.sub(r"\s{2,}.*$", "", h.group(2).strip()),
+            "gross_pay": find_amount(block, "Retribuzioni lorde"),
+            "social_charges": find_amount(block, "Oneri sociali"),
+            "other_charges": find_amount(block, "Altri oneri"),
+            "tfr": (
+                find_amount(block, "TFR esercizio")
+                + find_amount(block, "TFR erogato")
+                + find_amount(block, "TFR previdenza complementare")
+            ),
+            "inail": find_amount(block, "INAIL"),
+            "company_cost": parse_it_number(totals[-1]),
+        })
+
+    if not parsed:
+        raise ValueError("Nessun dipendente riconosciuto nel PDF.")
+    return year, month, parsed
 
 def import_cost_pdf(uploaded):
-    text = pdf_to_text(uploaded)
-    year, month = parse_period(text)
-    if not year or not month:
-        raise ValueError("Periodo mensile non riconosciuto nel PDF.")
-    rows = parse_employee_costs(text)
-    if not rows:
-        raise ValueError("Nessun costo dipendente riconosciuto nel PDF.")
-
-    conn = get_conn()
-    for r in rows:
-        emp_id = upsert_employee(conn, r["code"], r["name"])
-        conn.execute(
-            """
-            INSERT INTO monthly_costs(
-                employee_id, year, month, gross_pay, social_charges,
-                other_charges, tfr, inail, company_cost, source_file
-            )
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(employee_id, year, month) DO UPDATE SET
-                gross_pay=excluded.gross_pay,
-                social_charges=excluded.social_charges,
-                other_charges=excluded.other_charges,
-                tfr=excluded.tfr,
-                inail=excluded.inail,
-                company_cost=excluded.company_cost,
-                source_file=excluded.source_file
-            """,
-            (
-                emp_id, year, month, r["gross_pay"], r["social_charges"],
-                r["other_charges"], r["tfr"], r["inail"], r["company_cost"],
-                uploaded.name,
-            ),
+    year, month, parsed = parse_cost_report(pdf_text(uploaded))
+    for item in parsed:
+        existing = (
+            sb.table("employees")
+            .select("id")
+            .eq("code", item["code"])
+            .execute()
+            .data or []
         )
-    conn.commit()
-    conn.close()
-    return year, month, len(rows), parse_total_company(text)
+        if existing:
+            employee_id = existing[0]["id"]
+            sb.table("employees").update({"name": item["name"]}).eq("id", employee_id).execute()
+        else:
+            inserted = sb.table("employees").insert({
+                "code": item["code"],
+                "name": item["name"],
+                "department": "Da assegnare",
+                "active": True
+            }).execute().data
+            employee_id = inserted[0]["id"]
 
-def month_totals(year, month):
-    conn = get_conn()
-    costs = pd.read_sql_query(
-        """
-        SELECT e.id, e.code, e.name, e.department, e.role, e.level,
-               c.gross_pay, c.social_charges, c.other_charges, c.tfr,
-               c.inail, c.company_cost, c.net_pay, c.hours
-        FROM monthly_costs c
-        JOIN employees e ON e.id=c.employee_id
-        WHERE c.year=? AND c.month=?
-        ORDER BY e.name
-        """,
-        conn,
-        params=(year, month),
+        sb.table("monthly_costs").upsert({
+            "employee_id": employee_id,
+            "year": year,
+            "month": month,
+            "gross_pay": item["gross_pay"],
+            "social_charges": item["social_charges"],
+            "other_charges": item["other_charges"],
+            "tfr": item["tfr"],
+            "inail": item["inail"],
+            "company_cost": item["company_cost"],
+            "source_file": uploaded.name
+        }, on_conflict="employee_id,year,month").execute()
+
+    return year, month, len(parsed), sum(x["company_cost"] for x in parsed)
+
+def month_data(year, month):
+    costs = (
+        sb.table("monthly_costs")
+        .select("*,employees(id,name,department,role,level)")
+        .eq("year", year)
+        .eq("month", month)
+        .execute().data or []
     )
-    fringe = pd.read_sql_query(
-        """
-        SELECT employee_id, COALESCE(SUM(amount),0) amount
-        FROM fringe_benefits
-        WHERE substr(benefit_date,1,7)=?
-        GROUP BY employee_id
-        """,
-        conn,
-        params=(f"{year:04d}-{month:02d}",),
+    if not costs:
+        return pd.DataFrame(), 0.0, 0
+
+    data = []
+    for c in costs:
+        e = c.get("employees") or {}
+        data.append({
+            "employee_id": c["employee_id"],
+            "name": e.get("name", ""),
+            "department": e.get("department", "Da assegnare"),
+            "role": e.get("role", ""),
+            "level": e.get("level", ""),
+            "hours": float(c.get("hours") or 0),
+            "net_pay": float(c.get("net_pay") or 0),
+            "gross_pay": float(c.get("gross_pay") or 0),
+            "company_cost": float(c.get("company_cost") or 0),
+        })
+
+    df = pd.DataFrame(data)
+    start = f"{year:04d}-{month:02d}-01"
+    ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+    end = f"{ny:04d}-{nm:02d}-01"
+
+    fringe = (
+        sb.table("fringe_benefits").select("employee_id,amount")
+        .gte("benefit_date", start).lt("benefit_date", end).execute().data or []
     )
-    extra = pd.read_sql_query(
-        """
-        SELECT employee_id, COALESCE(SUM(amount),0) amount
-        FROM extra_payments
-        WHERE substr(payment_date,1,7)=?
-        GROUP BY employee_id
-        """,
-        conn,
-        params=(f"{year:04d}-{month:02d}",),
+    extras = (
+        sb.table("extra_payments").select("employee_id,amount")
+        .gte("payment_date", start).lt("payment_date", end).execute().data or []
     )
-    rev = conn.execute(
-        "SELECT revenue, covers FROM monthly_revenue WHERE year=? AND month=?",
-        (year, month),
-    ).fetchone()
-    conn.close()
 
-    if costs.empty:
-        return costs, 0.0, 0, 0.0, 0.0
+    f_map, x_map = {}, {}
+    for x in fringe:
+        f_map[x["employee_id"]] = f_map.get(x["employee_id"], 0) + float(x["amount"] or 0)
+    for x in extras:
+        x_map[x["employee_id"]] = x_map.get(x["employee_id"], 0) + float(x["amount"] or 0)
 
-    costs = costs.merge(fringe, how="left", left_on="id", right_on="employee_id")
-    costs = costs.rename(columns={"amount": "fringe"})
-    costs = costs.drop(columns=["employee_id"], errors="ignore")
-    costs = costs.merge(extra, how="left", left_on="id", right_on="employee_id")
-    costs = costs.rename(columns={"amount": "extra_cash"})
-    costs = costs.drop(columns=["employee_id"], errors="ignore")
-    costs["fringe"] = costs["fringe"].fillna(0)
-    costs["extra_cash"] = costs["extra_cash"].fillna(0)
-    costs["gestional_cost"] = costs["company_cost"] + costs["extra_cash"]
-    revenue, covers = rev if rev else (0.0, 0)
-    return costs, float(revenue), int(covers), costs["fringe"].sum(), costs["extra_cash"].sum()
+    df["fringe"] = df["employee_id"].map(f_map).fillna(0)
+    df["extra_cash"] = df["employee_id"].map(x_map).fillna(0)
+    df["management_cost"] = df["company_cost"] + df["extra_cash"]
 
-# -------------------- SIDEBAR --------------------
+    rev = (
+        sb.table("monthly_revenue").select("revenue,covers")
+        .eq("year", year).eq("month", month).execute().data or []
+    )
+    revenue = float(rev[0]["revenue"] or 0) if rev else 0.0
+    covers = int(rev[0]["covers"] or 0) if rev else 0
+    return df, revenue, covers
 
-st.sidebar.title("La Cambusa")
+st.sidebar.title("RV Manager")
 section = st.sidebar.radio(
-    "Modulo personale",
-    ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente", "Fringe benefit", "Extra da regolarizzare", "Impostazioni mese"]
+    "Personale",
+    ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
+     "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
 )
 
 today = date.today()
 years = list(range(2025, today.year + 2))
-selected_year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
-selected_month = st.sidebar.selectbox(
-    "Mese", list(MONTHS.keys()),
-    format_func=lambda x: MONTHS[x],
-    index=today.month - 1
-)
-
-# -------------------- DASHBOARD --------------------
+year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
+month = st.sidebar.selectbox("Mese", list(MONTHS), format_func=lambda x: MONTHS[x], index=today.month - 1)
 
 if section == "Cruscotto":
     st.title("Cruscotto gestione personale")
-    st.caption(f"{MONTHS[selected_month]} {selected_year}")
+    st.caption(f"{MONTHS[month]} {year}")
 
-    df, revenue, covers, fringe_total, extra_total = month_totals(selected_year, selected_month)
-
+    df, revenue, covers = month_data(year, month)
     if df.empty:
-        st.info("Non risultano ancora costi del personale importati per questo mese.")
+        st.info("Non risultano ancora costi importati per questo mese.")
     else:
-        official_cost = df["company_cost"].sum()
-        gestional_cost = df["gestional_cost"].sum()
+        official = df["company_cost"].sum()
+        extra = df["extra_cash"].sum()
+        fringe = df["fringe"].sum()
+        total = df["management_cost"].sum()
         hours = df["hours"].sum()
-        incidence = (gestional_cost / revenue * 100) if revenue else 0
-        cost_per_hour = (gestional_cost / hours) if hours else 0
-        cost_per_cover = (gestional_cost / covers) if covers else 0
+        incidence = total / revenue * 100 if revenue else 0
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Costo aziendale ufficiale", euro(official_cost))
-        c2.metric("Extra registrati", euro(extra_total))
-        c3.metric("Fringe benefit", euro(fringe_total))
-        c4.metric("Costo gestionale", euro(gestional_cost))
+        a, b, c, d = st.columns(4)
+        a.metric("Costo aziendale", euro(official))
+        b.metric("Extra registrati", euro(extra))
+        c.metric("Fringe benefit", euro(fringe))
+        d.metric("Costo gestionale", euro(total))
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("Fatturato", euro(revenue))
-        c6.metric("Incidenza personale", f"{incidence:.1f}%")
-        c7.metric("Costo medio/ora", euro(cost_per_hour) if hours else "Ore mancanti")
-        c8.metric("Costo per coperto", euro(cost_per_cover) if covers else "Coperti mancanti")
+        e, f, g, h = st.columns(4)
+        e.metric("Fatturato", euro(revenue))
+        f.metric("Incidenza personale", f"{incidence:.1f}%")
+        g.metric("Costo medio/ora", euro(total / hours) if hours else "Ore mancanti")
+        h.metric("Costo/coperto", euro(total / covers) if covers else "Coperti mancanti")
 
-        if revenue:
-            if incidence <= 30:
-                st.success(f"Incidenza personale {incidence:.1f}%: entro l'obiettivo del 30%.")
-            elif incidence <= 35:
-                st.warning(f"Incidenza personale {incidence:.1f}%: fascia di attenzione.")
-            else:
-                st.error(f"Incidenza personale {incidence:.1f}%: superiore al 35%.")
-
-        chart = df.groupby("department", dropna=False)["gestional_cost"].sum().sort_values(ascending=False)
         st.subheader("Costo per reparto")
-        st.bar_chart(chart)
+        st.bar_chart(df.groupby("department")["management_cost"].sum())
 
-        st.subheader("Costo per dipendente")
-        view = df[[
-            "name", "department", "hours", "gross_pay", "social_charges",
-            "tfr", "inail", "company_cost", "fringe", "extra_cash", "gestional_cost"
-        ]].copy()
-        view.columns = [
-            "Dipendente", "Reparto", "Ore", "Lordo", "Oneri sociali",
-            "TFR", "INAIL", "Costo azienda", "Fringe", "Extra", "Costo gestionale"
-        ]
-        for col in ["Lordo", "Oneri sociali", "TFR", "INAIL", "Costo azienda", "Fringe", "Extra", "Costo gestionale"]:
+        view = df[["name", "department", "hours", "net_pay", "gross_pay",
+                   "company_cost", "fringe", "extra_cash", "management_cost"]].copy()
+        view.columns = ["Dipendente", "Reparto", "Ore", "Netto", "Lordo",
+                        "Costo azienda", "Fringe", "Extra", "Costo gestionale"]
+        for col in ["Netto", "Lordo", "Costo azienda", "Fringe", "Extra", "Costo gestionale"]:
             view[col] = view[col].map(euro)
         st.dataframe(view, use_container_width=True, hide_index=True)
 
-# -------------------- IMPORT --------------------
-
 elif section == "Importa costi":
-    st.title("Importazione prospetto costi paghe")
-    st.write(
-        "Carica il PDF **Costo del personale - singoli dipendenti/complessivo per ditta**. "
-        "Il sistema riconosce periodo, dipendenti e costo aziendale."
-    )
-    uploaded = st.file_uploader("PDF costi paghe", type=["pdf"])
-    if uploaded and st.button("Importa PDF", type="primary"):
+    st.title("Importa prospetto costi paghe")
+    uploaded = st.file_uploader("PDF del consulente", type=["pdf"])
+    if uploaded and st.button("Importa", type="primary"):
         try:
             y, m, count, total = import_cost_pdf(uploaded)
-            st.success(
-                f"Importati {count} dipendenti per {MONTHS[m]} {y}. "
-                f"Totale ditta rilevato: {euro(total)}."
-            )
+            st.success(f"Importati {count} dipendenti per {MONTHS[m]} {y}. Totale: {euro(total)}")
         except Exception as exc:
-            st.error(f"Importazione non riuscita: {exc}")
+            st.error(str(exc))
 
-    st.divider()
-    st.subheader("Inserimento ore e netto")
-    st.caption("Questi valori possono essere importati in una fase successiva dai cedolini oppure inseriti manualmente.")
-    conn = get_conn()
-    employees = pd.read_sql_query("SELECT id, name FROM employees ORDER BY name", conn)
-    conn.close()
+    employees = employees_df()
     if not employees.empty:
-        emp_name = st.selectbox("Dipendente", employees["name"].tolist())
-        emp_id = int(employees.loc[employees["name"] == emp_name, "id"].iloc[0])
-        col1, col2 = st.columns(2)
-        hours = col1.number_input("Ore del mese", min_value=0.0, step=0.5)
-        net = col2.number_input("Netto in busta", min_value=0.0, step=10.0)
+        st.divider()
+        st.subheader("Ore e netto")
+        name = st.selectbox("Dipendente", employees["name"].tolist())
+        employee_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
+        c1, c2 = st.columns(2)
+        hours = c1.number_input("Ore del mese", min_value=0.0, step=0.5)
+        net = c2.number_input("Netto in busta", min_value=0.0, step=10.0)
         if st.button("Salva ore e netto"):
-            conn = get_conn()
-            conn.execute(
-                """
-                INSERT INTO monthly_costs(employee_id, year, month, hours, net_pay)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(employee_id, year, month) DO UPDATE SET
-                    hours=excluded.hours, net_pay=excluded.net_pay
-                """,
-                (emp_id, selected_year, selected_month, hours, net),
-            )
-            conn.commit()
-            conn.close()
-            st.success("Ore e netto aggiornati.")
-
-# -------------------- EMPLOYEES --------------------
+            sb.table("monthly_costs").upsert({
+                "employee_id": employee_id, "year": year, "month": month,
+                "hours": hours, "net_pay": net
+            }, on_conflict="employee_id,year,month").execute()
+            st.success("Aggiornato.")
 
 elif section == "Dipendenti":
-    st.title("Anagrafica dipendenti")
-    conn = get_conn()
-    employees = pd.read_sql_query("SELECT * FROM employees ORDER BY name", conn)
-    conn.close()
-    if employees.empty:
-        st.info("Importa almeno un prospetto paghe.")
-    else:
+    st.title("Dipendenti")
+    employees = employees_df()
+
+    with st.expander("Nuovo dipendente", expanded=employees.empty):
+        with st.form("new_emp"):
+            code = st.text_input("Codice dipendente")
+            name = st.text_input("Nome e cognome")
+            c1, c2, c3 = st.columns(3)
+            department = c1.selectbox("Reparto", ["Sala", "Bar", "Cucina", "Amministrazione", "Da assegnare"])
+            role = c2.text_input("Ruolo")
+            level = c3.text_input("Livello")
+            save = st.form_submit_button("Crea", type="primary")
+        if save:
+            sb.table("employees").insert({
+                "code": code or None, "name": name, "department": department,
+                "role": role or None, "level": level or None, "active": True
+            }).execute()
+            st.success("Dipendente creato.")
+            st.rerun()
+
+    if not employees.empty:
         edited = st.data_editor(
-            employees[["id", "code", "name", "role", "level", "department", "hire_date", "active"]],
-            use_container_width=True,
-            hide_index=True,
+            employees, use_container_width=True, hide_index=True,
             disabled=["id", "code", "name"],
             column_config={
                 "department": st.column_config.SelectboxColumn(
-                    "Reparto",
-                    options=["Sala", "Bar", "Cucina", "Amministrazione", "Da assegnare"]
+                    "Reparto", options=["Sala", "Bar", "Cucina", "Amministrazione", "Da assegnare"]
                 ),
-                "active": st.column_config.CheckboxColumn("Attivo"),
-            },
+                "active": st.column_config.CheckboxColumn("Attivo")
+            }
         )
-        if st.button("Salva anagrafica", type="primary"):
-            conn = get_conn()
+        if st.button("Salva modifiche"):
             for _, r in edited.iterrows():
-                conn.execute(
-                    """
-                    UPDATE employees
-                    SET role=?, level=?, department=?, hire_date=?, active=?
-                    WHERE id=?
-                    """,
-                    (r["role"], r["level"], r["department"], r["hire_date"], int(bool(r["active"])), int(r["id"])),
-                )
-            conn.commit()
-            conn.close()
-            st.success("Anagrafica aggiornata.")
-
-
-# -------------------- EMPLOYEE DETAIL --------------------
+                sb.table("employees").update({
+                    "department": r["department"],
+                    "role": None if pd.isna(r["role"]) else r["role"],
+                    "level": None if pd.isna(r["level"]) else r["level"],
+                    "active": bool(r["active"])
+                }).eq("id", int(r["id"])).execute()
+            st.success("Salvato.")
 
 elif section == "Scheda dipendente":
-    st.title("Scheda dipendente definitiva")
-    conn = get_conn()
-    employees = pd.read_sql_query(
-        "SELECT id, code, name, role, level, department, hire_date FROM employees ORDER BY name",
-        conn
-    )
-    conn.close()
-
+    st.title("Scheda dipendente")
+    employees = employees_df()
     if employees.empty:
-        st.info("Importa prima un prospetto paghe per creare l'anagrafica.")
+        st.info("Nessun dipendente.")
     else:
-        selected_name = st.selectbox("Seleziona dipendente", employees["name"].tolist())
-        emp = employees.loc[employees["name"] == selected_name].iloc[0]
-        emp_id = int(emp["id"])
+        name = st.selectbox("Dipendente", employees["name"].tolist())
+        emp = employees.loc[employees["name"] == name].iloc[0]
+        employee_id = int(emp["id"])
 
-        conn = get_conn()
-        profile = conn.execute(
-            """
-            SELECT phone, email, tax_code, iban, address, contract_type,
-                   contract_end, weekly_hours, emergency_contact, notes
-            FROM employee_profiles WHERE employee_id=?
-            """,
-            (emp_id,),
-        ).fetchone()
-        conn.close()
-
-        profile = profile or ("", "", "", "", "", "", "", 0, "", "")
-
-        st.subheader(selected_name)
-        a, b, c, d = st.columns(4)
+        a, b, c = st.columns(3)
         a.metric("Reparto", emp["department"] or "Da assegnare")
         b.metric("Ruolo", emp["role"] or "Da definire")
         c.metric("Livello", emp["level"] or "Da definire")
-        d.metric("Codice", emp["code"])
 
-        tabs = st.tabs([
-            "Dati e contratto", "Costi e paghe", "Timeline",
-            "Documenti e scadenze", "Valutazione", "Note"
-        ])
+        profile_data = sb.table("employee_profiles").select("*").eq("employee_id", employee_id).execute().data or []
+        profile = profile_data[0] if profile_data else {}
 
-        with tabs[0]:
-            with st.form("profile_form"):
-                c1, c2 = st.columns(2)
-                phone = c1.text_input("Telefono", value=profile[0] or "")
-                email = c2.text_input("Email", value=profile[1] or "")
-                tax_code = c1.text_input("Codice fiscale", value=profile[2] or "")
-                iban = c2.text_input("IBAN", value=profile[3] or "")
-                address = st.text_input("Indirizzo", value=profile[4] or "")
-                contract_type = c1.selectbox(
-                    "Tipo contratto",
-                    ["", "Tempo indeterminato", "Tempo determinato", "Apprendistato", "A chiamata", "Collaborazione", "Altro"],
-                    index=0 if not profile[5] else (
-                        ["", "Tempo indeterminato", "Tempo determinato", "Apprendistato", "A chiamata", "Collaborazione", "Altro"].index(profile[5])
-                        if profile[5] in ["", "Tempo indeterminato", "Tempo determinato", "Apprendistato", "A chiamata", "Collaborazione", "Altro"] else 0
-                    )
-                )
-                contract_end = c2.text_input("Scadenza contratto (AAAA-MM-GG)", value=profile[6] or "")
-                weekly_hours = c1.number_input("Ore settimanali contrattuali", min_value=0.0, value=float(profile[7] or 0), step=1.0)
-                emergency_contact = c2.text_input("Contatto di emergenza", value=profile[8] or "")
-                notes = st.text_area("Note anagrafiche", value=profile[9] or "")
-                save = st.form_submit_button("Salva scheda", type="primary")
+        with st.form("profile"):
+            c1, c2 = st.columns(2)
+            phone = c1.text_input("Telefono", value=profile.get("phone") or "")
+            email = c2.text_input("Email", value=profile.get("email") or "")
+            tax_code = c1.text_input("Codice fiscale", value=profile.get("tax_code") or "")
+            iban = c2.text_input("IBAN", value=profile.get("iban") or "")
+            address = st.text_input("Indirizzo", value=profile.get("address") or "")
+            contract_type = c1.text_input("Tipo contratto", value=profile.get("contract_type") or "")
+            contract_end = c2.text_input("Scadenza contratto AAAA-MM-GG", value=str(profile.get("contract_end") or ""))
+            weekly_hours = c1.number_input("Ore settimanali", min_value=0.0, value=float(profile.get("weekly_hours") or 0))
+            emergency = c2.text_input("Contatto emergenza", value=profile.get("emergency_contact") or "")
+            notes = st.text_area("Note", value=profile.get("notes") or "")
+            save = st.form_submit_button("Salva scheda", type="primary")
+        if save:
+            sb.table("employee_profiles").upsert({
+                "employee_id": employee_id, "phone": phone, "email": email,
+                "tax_code": tax_code, "iban": iban, "address": address,
+                "contract_type": contract_type or None,
+                "contract_end": contract_end or None,
+                "weekly_hours": weekly_hours,
+                "emergency_contact": emergency, "notes": notes
+            }, on_conflict="employee_id").execute()
+            st.success("Scheda salvata.")
 
-            if save:
-                conn = get_conn()
-                conn.execute(
-                    """
-                    INSERT INTO employee_profiles(
-                        employee_id, phone, email, tax_code, iban, address,
-                        contract_type, contract_end, weekly_hours,
-                        emergency_contact, notes
-                    )
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(employee_id) DO UPDATE SET
-                        phone=excluded.phone, email=excluded.email,
-                        tax_code=excluded.tax_code, iban=excluded.iban,
-                        address=excluded.address, contract_type=excluded.contract_type,
-                        contract_end=excluded.contract_end,
-                        weekly_hours=excluded.weekly_hours,
-                        emergency_contact=excluded.emergency_contact,
-                        notes=excluded.notes
-                    """,
-                    (
-                        emp_id, phone, email, tax_code, iban, address,
-                        contract_type, contract_end, weekly_hours,
-                        emergency_contact, notes
-                    ),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Scheda dipendente aggiornata.")
-
-        with tabs[1]:
-            conn = get_conn()
-            costs = pd.read_sql_query(
-                """
-                SELECT year Anno, month Mese, hours Ore, net_pay Netto,
-                       gross_pay Lordo, company_cost "Costo azienda"
-                FROM monthly_costs
-                WHERE employee_id=?
-                ORDER BY year DESC, month DESC
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            fringe = pd.read_sql_query(
-                """
-                SELECT benefit_date Data, amount Importo, category Categoria, note Nota
-                FROM fringe_benefits WHERE employee_id=?
-                ORDER BY benefit_date DESC
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            extra = pd.read_sql_query(
-                """
-                SELECT payment_date Data, amount Importo, reason Motivo,
-                       payment_method Modalità, regularized Regolarizzato
-                FROM extra_payments WHERE employee_id=?
-                ORDER BY payment_date DESC
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            conn.close()
-
-            if costs.empty:
-                st.info("Nessun costo mensile importato.")
-            else:
-                costs["Mese"] = costs["Mese"].map(MONTHS)
-                st.dataframe(costs, use_container_width=True, hide_index=True)
-                chart = costs.copy()
-                chart["Periodo"] = chart["Anno"].astype(str) + "-" + chart["Mese"]
-                st.line_chart(chart.set_index("Periodo")[["Costo azienda"]])
-
-            st.markdown("#### Fringe benefit")
-            st.dataframe(fringe, use_container_width=True, hide_index=True)
-            st.markdown("#### Importi extra registrati")
-            st.dataframe(extra, use_container_width=True, hide_index=True)
-
-        with tabs[2]:
-            with st.form("event_form"):
-                e1, e2 = st.columns(2)
-                event_date = e1.date_input("Data evento")
-                event_type = e2.selectbox(
-                    "Tipo evento",
-                    ["Assunzione", "Rinnovo", "Cambio livello", "Premio", "Formazione",
-                     "Ferie", "Permesso", "Malattia", "Richiamo", "Nota", "Altro"]
-                )
-                title = st.text_input("Titolo")
-                details = st.text_area("Dettagli")
-                amount = st.number_input("Importo collegato", min_value=0.0, step=10.0)
-                add_event = st.form_submit_button("Aggiungi alla timeline", type="primary")
-            if add_event and title.strip():
-                conn = get_conn()
-                conn.execute(
-                    """
-                    INSERT INTO employee_events(employee_id, event_date, event_type, title, details, amount)
-                    VALUES(?,?,?,?,?,?)
-                    """,
-                    (emp_id, event_date.isoformat(), event_type, title.strip(), details, amount),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Evento aggiunto.")
-
-            conn = get_conn()
-            events = pd.read_sql_query(
-                """
-                SELECT event_date Data, event_type Tipo, title Titolo, details Dettagli, amount Importo
-                FROM employee_events WHERE employee_id=?
-                ORDER BY event_date DESC, id DESC
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            conn.close()
-            st.dataframe(events, use_container_width=True, hide_index=True)
-
-        with tabs[3]:
-            with st.form("doc_form"):
-                d1, d2 = st.columns(2)
-                doc_type = d1.selectbox(
-                    "Tipo documento",
-                    ["Contratto", "Documento identità", "Codice fiscale", "HACCP",
-                     "Visita medica", "Sicurezza", "Permesso di soggiorno", "Altro"]
-                )
-                file_name = d2.text_input("Nome file o riferimento")
-                issue_date = d1.text_input("Data rilascio (AAAA-MM-GG)")
-                expiry_date = d2.text_input("Scadenza (AAAA-MM-GG)")
-                status = d1.selectbox("Stato", ["Valido", "In scadenza", "Scaduto", "Da acquisire"])
-                note = st.text_input("Nota documento")
-                add_doc = st.form_submit_button("Registra documento", type="primary")
-            if add_doc:
-                conn = get_conn()
-                conn.execute(
-                    """
-                    INSERT INTO employee_documents(
-                        employee_id, document_type, file_name, issue_date,
-                        expiry_date, status, note
-                    )
-                    VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (emp_id, doc_type, file_name, issue_date, expiry_date, status, note),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Documento registrato.")
-
-            conn = get_conn()
-            docs = pd.read_sql_query(
-                """
-                SELECT document_type Documento, file_name File, issue_date Rilascio,
-                       expiry_date Scadenza, status Stato, note Nota
-                FROM employee_documents WHERE employee_id=?
-                ORDER BY expiry_date
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            conn.close()
-            st.dataframe(docs, use_container_width=True, hide_index=True)
-
-        with tabs[4]:
-            with st.form("rating_form"):
-                rating_date = st.date_input("Data valutazione")
-                r1, r2, r3 = st.columns(3)
-                punctuality = r1.slider("Puntualità", 1, 5, 3)
-                professionalism = r2.slider("Professionalità", 1, 5, 3)
-                sales = r3.slider("Capacità di vendita", 1, 5, 3)
-                flexibility = r1.slider("Flessibilità", 1, 5, 3)
-                teamwork = r2.slider("Lavoro di squadra", 1, 5, 3)
-                leadership = r3.slider("Leadership", 1, 5, 3)
-                note = st.text_area("Nota valutazione")
-                add_rating = st.form_submit_button("Salva valutazione", type="primary")
-            if add_rating:
-                conn = get_conn()
-                conn.execute(
-                    """
-                    INSERT INTO employee_ratings(
-                        employee_id, rating_date, punctuality, professionalism,
-                        sales, flexibility, teamwork, leadership, note
-                    )
-                    VALUES(?,?,?,?,?,?,?,?,?)
-                    """,
-                    (emp_id, rating_date.isoformat(), punctuality, professionalism,
-                     sales, flexibility, teamwork, leadership, note),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Valutazione registrata.")
-
-            conn = get_conn()
-            ratings = pd.read_sql_query(
-                """
-                SELECT rating_date Data, punctuality Puntualità,
-                       professionalism Professionalità, sales Vendita,
-                       flexibility Flessibilità, teamwork Squadra,
-                       leadership Leadership, note Nota
-                FROM employee_ratings WHERE employee_id=?
-                ORDER BY rating_date DESC
-                """,
-                conn,
-                params=(emp_id,),
-            )
-            conn.close()
-            if not ratings.empty:
-                ratings["Media"] = ratings[
-                    ["Puntualità", "Professionalità", "Vendita", "Flessibilità", "Squadra", "Leadership"]
-                ].mean(axis=1).round(2)
-            st.dataframe(ratings, use_container_width=True, hide_index=True)
-
-        with tabs[5]:
-            st.write("Le note generali si modificano nella sezione **Dati e contratto**.")
-            conn = get_conn()
-            profile_notes = conn.execute(
-                "SELECT notes FROM employee_profiles WHERE employee_id=?",
-                (emp_id,),
-            ).fetchone()
-            conn.close()
-            st.text_area("Note attuali", value=(profile_notes[0] if profile_notes else ""), height=220, disabled=True)
-
-# -------------------- FRINGE --------------------
+        history = (
+            sb.table("monthly_costs")
+            .select("year,month,hours,net_pay,gross_pay,company_cost")
+            .eq("employee_id", employee_id)
+            .order("year", desc=True).order("month", desc=True)
+            .execute().data or []
+        )
+        st.subheader("Storico costi")
+        st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
 
 elif section == "Fringe benefit":
     st.title("Fringe benefit")
-    conn = get_conn()
-    employees = pd.read_sql_query("SELECT id, name FROM employees WHERE active=1 ORDER BY name", conn)
-    conn.close()
-    if employees.empty:
-        st.info("Nessun dipendente presente.")
-    else:
-        with st.form("fringe_form"):
-            name = st.selectbox("Dipendente", employees["name"])
-            d = st.date_input("Data", value=date(selected_year, selected_month, 1))
+    employees = employees_df()
+    if not employees.empty:
+        with st.form("fringe"):
+            name = st.selectbox("Dipendente", employees["name"].tolist())
+            employee_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
+            d = st.date_input("Data", value=date(year, month, 1))
             amount = st.number_input("Importo", min_value=0.0, step=10.0)
             category = st.selectbox("Categoria", ["Buoni", "Alloggio", "Auto", "Telefono", "Pasto", "Altro"])
             note = st.text_input("Nota")
-            submit = st.form_submit_button("Registra fringe benefit", type="primary")
-        if submit:
-            emp_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
-            conn = get_conn()
-            conn.execute(
-                "INSERT INTO fringe_benefits(employee_id, benefit_date, amount, category, note) VALUES(?,?,?,?,?)",
-                (emp_id, d.isoformat(), amount, category, note),
-            )
-            conn.commit()
-            conn.close()
-            st.success("Fringe benefit registrato.")
-
-# -------------------- EXTRA --------------------
+            save = st.form_submit_button("Registra", type="primary")
+        if save:
+            sb.table("fringe_benefits").insert({
+                "employee_id": employee_id, "benefit_date": d.isoformat(),
+                "amount": amount, "category": category, "note": note
+            }).execute()
+            st.success("Fringe registrato.")
 
 elif section == "Extra da regolarizzare":
-    st.title("Pagamenti extra da regolarizzare")
-    st.warning(
-        "Questa sezione serve a registrare importi extra per il controllo interno. "
-        "Gli importi devono essere comunicati al consulente e regolarizzati secondo la normativa; "
-        "il software non è progettato per occultare pagamenti."
-    )
-    conn = get_conn()
-    employees = pd.read_sql_query("SELECT id, name FROM employees WHERE active=1 ORDER BY name", conn)
-    conn.close()
-    if employees.empty:
-        st.info("Nessun dipendente presente.")
-    else:
-        with st.form("extra_form"):
-            name = st.selectbox("Dipendente", employees["name"])
-            d = st.date_input("Data pagamento", value=date(selected_year, selected_month, 1))
-            amount = st.number_input("Importo extra", min_value=0.0, step=10.0)
-            reason = st.text_input("Motivo obbligatorio")
-            method = st.selectbox("Modalità", ["Da regolarizzare", "Bonifico", "Contanti registrati", "Altro"])
+    st.title("Extra da regolarizzare")
+    st.warning("Registro interno. Gli importi devono essere comunicati e regolarizzati con il consulente.")
+    employees = employees_df()
+    if not employees.empty:
+        with st.form("extra"):
+            name = st.selectbox("Dipendente", employees["name"].tolist())
+            employee_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
+            d = st.date_input("Data", value=date(year, month, 1))
+            amount = st.number_input("Importo", min_value=0.0, step=10.0)
+            reason = st.text_input("Motivo")
             note = st.text_area("Nota")
-            submit = st.form_submit_button("Registra importo", type="primary")
-        if submit:
-            if not reason.strip():
-                st.error("Inserisci il motivo.")
-            else:
-                emp_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
-                conn = get_conn()
-                conn.execute(
-                    """
-                    INSERT INTO extra_payments(employee_id, payment_date, amount, reason, payment_method, note)
-                    VALUES(?,?,?,?,?,?)
-                    """,
-                    (emp_id, d.isoformat(), amount, reason.strip(), method, note),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Importo registrato come voce da regolarizzare.")
+            save = st.form_submit_button("Registra", type="primary")
+        if save and reason:
+            sb.table("extra_payments").insert({
+                "employee_id": employee_id, "payment_date": d.isoformat(),
+                "amount": amount, "reason": reason,
+                "payment_method": "Da regolarizzare",
+                "regularized": False, "note": note
+            }).execute()
+            st.success("Extra registrato.")
 
-        conn = get_conn()
-        extras = pd.read_sql_query(
-            """
-            SELECT x.id, e.name Dipendente, x.payment_date Data, x.amount Importo,
-                   x.reason Motivo, x.payment_method Modalità, x.regularized Regolarizzato
-            FROM extra_payments x JOIN employees e ON e.id=x.employee_id
-            ORDER BY x.payment_date DESC
-            """,
-            conn,
-        )
-        conn.close()
-        if not extras.empty:
-            extras["Importo"] = extras["Importo"].map(euro)
-            st.dataframe(extras.drop(columns=["id"]), use_container_width=True, hide_index=True)
+elif section == "Dati del mese":
+    st.title("Dati del mese")
+    existing = (
+        sb.table("monthly_revenue").select("revenue,covers")
+        .eq("year", year).eq("month", month).execute().data or []
+    )
+    revenue = float(existing[0]["revenue"] or 0) if existing else 0.0
+    covers = int(existing[0]["covers"] or 0) if existing else 0
 
-# -------------------- SETTINGS --------------------
-
-elif section == "Impostazioni mese":
-    st.title("Dati economici del mese")
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT revenue, covers FROM monthly_revenue WHERE year=? AND month=?",
-        (selected_year, selected_month),
-    ).fetchone()
-    conn.close()
-    revenue = float(row[0]) if row else 0.0
-    covers = int(row[1]) if row else 0
-
-    with st.form("month_form"):
-        new_revenue = st.number_input("Fatturato del mese", min_value=0.0, value=revenue, step=1000.0)
-        new_covers = st.number_input("Coperti del mese", min_value=0, value=covers, step=10)
-        submit = st.form_submit_button("Salva dati mese", type="primary")
-    if submit:
-        conn = get_conn()
-        conn.execute(
-            """
-            INSERT INTO monthly_revenue(year, month, revenue, covers)
-            VALUES(?,?,?,?)
-            ON CONFLICT(year, month) DO UPDATE SET
-                revenue=excluded.revenue, covers=excluded.covers
-            """,
-            (selected_year, selected_month, new_revenue, new_covers),
-        )
-        conn.commit()
-        conn.close()
-        st.success("Dati economici aggiornati.")
+    with st.form("month"):
+        new_revenue = st.number_input("Fatturato", min_value=0.0, value=revenue, step=1000.0)
+        new_covers = st.number_input("Coperti", min_value=0, value=covers, step=10)
+        save = st.form_submit_button("Salva", type="primary")
+    if save:
+        sb.table("monthly_revenue").upsert({
+            "year": year, "month": month,
+            "revenue": new_revenue, "covers": new_covers
+        }, on_conflict="year,month").execute()
+        st.success("Dati aggiornati.")

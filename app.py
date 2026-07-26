@@ -58,26 +58,65 @@ def pdf_text(uploaded):
     reader = PdfReader(BytesIO(uploaded.getvalue()))
     return "\n".join((p.extract_text() or "") for p in reader.pages)
 
+def normalize_pdf_text(text):
+    """Normalizza spazi e caratteri tipici dei PDF del consulente."""
+    text = text.replace("\u00a0", " ").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
 def find_amount(block, label):
-    m = re.search(rf"{re.escape(label)}\s+([\d\.,-]+)", block, re.I)
-    return parse_it_number(m.group(1)) if m else 0.0
+    # Cerca la voce all'inizio di una riga, evitando di confondere
+    # "Oneri sociali" con "Oneri sociali collaboratori".
+    pattern = rf"(?im)^\s*{re.escape(label)}\s+(-?[\d\.]+,\d{{2}})\s*$"
+    matches = re.findall(pattern, block)
+    return parse_it_number(matches[-1]) if matches else 0.0
 
 def parse_cost_report(text):
-    pm = re.search(r"periodo da\s+(\d{2})/(\d{4})\s+a\s+\d{2}/\d{4}", text, re.I)
+    text = normalize_pdf_text(text)
+
+    pm = re.search(
+        r"periodo\s+da\s+(\d{2})/(\d{4})\s+a\s+\d{2}/\d{4}",
+        text,
+        re.I,
+    )
     if not pm:
-        raise ValueError("Periodo non riconosciuto.")
+        raise ValueError("Periodo non riconosciuto nel PDF.")
     year, month = int(pm.group(2)), int(pm.group(1))
 
-    sections = re.split(r"(?=Dipendente\s*:\s*\d+)", text, flags=re.I)
+    # Il prospetto può spezzare lo stesso dipendente su due pagine e
+    # ripetere l'intestazione. Accorpiamo quindi tutti i blocchi con lo
+    # stesso codice dipendente prima di estrarre i valori.
+    headers = list(re.finditer(
+        r"(?im)^\s*Dipendente\s*:\s*(\d+)\s+([^\n]+?)\s*$",
+        text,
+    ))
+
+    grouped = {}
+    for index, header in enumerate(headers):
+        start = header.start()
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        code = header.group(1).strip()
+        name = re.sub(r"\s{2,}", " ", header.group(2).strip())
+        block = text[start:end]
+
+        if code not in grouped:
+            grouped[code] = {"name": name, "blocks": []}
+        grouped[code]["blocks"].append(block)
+
     parsed = []
-    for block in sections:
-        h = re.search(r"Dipendente\s*:\s*(\d+)\s+([^\n]+)", block, re.I)
-        totals = re.findall(r"Totale dipendente:\s*([\d\.,]+)", block, re.I)
-        if not h or not totals:
+    for code, item in grouped.items():
+        block = "\n".join(item["blocks"])
+        totals = re.findall(
+            r"(?im)^\s*Totale dipendente\s*:\s*([\d\.]+,\d{2})\s*$",
+            block,
+        )
+        if not totals:
             continue
+
         parsed.append({
-            "code": h.group(1).strip(),
-            "name": re.sub(r"\s{2,}.*$", "", h.group(2).strip()),
+            "code": code,
+            "name": item["name"],
             "gross_pay": find_amount(block, "Retribuzioni lorde"),
             "social_charges": find_amount(block, "Oneri sociali"),
             "other_charges": find_amount(block, "Altri oneri"),
@@ -91,7 +130,10 @@ def parse_cost_report(text):
         })
 
     if not parsed:
-        raise ValueError("Nessun dipendente riconosciuto nel PDF.")
+        raise ValueError(
+            "Nessun dipendente riconosciuto. Verifica che il PDF sia il "
+            "prospetto 'Costo del personale - singoli dipendenti'."
+        )
     return year, month, parsed
 
 def import_cost_pdf(uploaded):
@@ -241,6 +283,7 @@ if section == "Cruscotto":
 
 elif section == "Importa costi":
     st.title("Importa prospetto costi paghe")
+    st.caption("Il mese e l’anno vengono letti automaticamente dal PDF, indipendentemente dai filtri laterali.")
     uploaded = st.file_uploader("PDF del consulente", type=["pdf"])
     if uploaded and st.button("Importa", type="primary"):
         try:

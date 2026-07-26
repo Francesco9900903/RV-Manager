@@ -11,3 +11,9 @@ secret_key = "LA-TUA-SECRET-KEY"
 ```
 
 Non caricare mai la secret key su GitHub.
+
+
+## Correzione parser PDF
+- riconosce il formato del prospetto La Cambusa;
+- gestisce dipendenti spezzati su più pagine;
+- rileva automaticamente mese e anno dal PDF.

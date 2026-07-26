@@ -1105,8 +1105,174 @@ def payslip_download_url(storage_path, client):
     return getattr(result, "signed_url", None)
 
 
-st.sidebar.title("RV Manager")
-st.sidebar.caption("Versione 3.9 dashboard")
+
+def manager_daily_snapshot(selected_year, selected_month):
+    today = date.today()
+    month_start, month_end = month_bounds(selected_year, selected_month)
+
+    employees = (
+        sb.table("employees")
+        .select("id,name,department,active")
+        .eq("active", True)
+        .execute().data or []
+    )
+    employee_map = {int(e["id"]): e for e in employees}
+
+    today_clock = (
+        sb.table("clock_entries")
+        .select("employee_id,clock_in,clock_out,status,work_date")
+        .eq("work_date", today.isoformat())
+        .execute().data or []
+    )
+    present_ids = {
+        int(row["employee_id"])
+        for row in today_clock
+        if row.get("clock_in") and not row.get("clock_out")
+    }
+    open_entries = [
+        row for row in today_clock
+        if row.get("clock_in") and not row.get("clock_out")
+    ]
+
+    timesheets = (
+        sb.table("timesheets")
+        .select("employee_id,work_date,ordinary_hours,overtime_hours,status")
+        .gte("work_date", month_start.isoformat())
+        .lt("work_date", month_end.isoformat())
+        .execute().data or []
+    )
+    approved = [r for r in timesheets if r.get("status") == "approved"]
+    pending = [r for r in timesheets if r.get("status") == "submitted"]
+
+    total_hours = sum(
+        float(r.get("ordinary_hours") or 0) + float(r.get("overtime_hours") or 0)
+        for r in approved
+    )
+    overtime_total = sum(float(r.get("overtime_hours") or 0) for r in approved)
+
+    today_rows = [r for r in approved if r.get("work_date") == today.isoformat()]
+    today_hours = sum(
+        float(r.get("ordinary_hours") or 0) + float(r.get("overtime_hours") or 0)
+        for r in today_rows
+    )
+
+    costs = (
+        sb.table("monthly_costs")
+        .select("company_cost")
+        .eq("year", selected_year)
+        .eq("month", selected_month)
+        .execute().data or []
+    )
+    monthly_cost = sum(float(r.get("company_cost") or 0) for r in costs)
+    avg_hour_cost = monthly_cost / total_hours if total_hours else 0
+    today_cost = today_hours * avg_hour_cost if avg_hour_cost else 0
+
+    revenue_rows = (
+        sb.table("monthly_revenue")
+        .select("revenue,covers")
+        .eq("year", selected_year)
+        .eq("month", selected_month)
+        .execute().data or []
+    )
+    revenue = float(revenue_rows[0].get("revenue") or 0) if revenue_rows else 0
+    covers = int(revenue_rows[0].get("covers") or 0) if revenue_rows else 0
+    incidence = monthly_cost / revenue * 100 if revenue else 0
+
+    payslip_result = (
+        sb.table("payslips")
+        .select("id", count="exact")
+        .eq("year", selected_year)
+        .eq("month", selected_month)
+        .eq("status", "published")
+        .execute()
+    )
+    payslip_count = payslip_result.count or 0
+
+    overtime_by_employee = {}
+    for row in approved:
+        employee_id = int(row["employee_id"])
+        overtime_by_employee[employee_id] = (
+            overtime_by_employee.get(employee_id, 0)
+            + float(row.get("overtime_hours") or 0)
+        )
+
+    anomalies = []
+    for row in open_entries:
+        employee = employee_map.get(int(row["employee_id"]), {})
+        anomalies.append({
+            "Priorità": "Alta",
+            "Dipendente": employee.get("name", "Dipendente"),
+            "Anomalia": "Uscita non registrata",
+        })
+
+    for employee_id, overtime in overtime_by_employee.items():
+        if overtime >= 10:
+            employee = employee_map.get(employee_id, {})
+            anomalies.append({
+                "Priorità": "Media",
+                "Dipendente": employee.get("name", "Dipendente"),
+                "Anomalia": f"Straordinari elevati: {overtime:.2f} ore",
+            })
+
+    agenda = []
+    if pending:
+        agenda.append(f"Approva {len(pending)} registrazioni ore.")
+    if open_entries:
+        agenda.append(f"Controlla {len(open_entries)} timbrature senza uscita.")
+    if payslip_count == 0:
+        agenda.append("Pubblica le buste paga del mese.")
+    if overtime_total >= 20:
+        agenda.append(f"Verifica {overtime_total:.2f} ore di straordinario.")
+    if not agenda:
+        agenda.append("Nessuna attività urgente.")
+
+    daily_status = {}
+    for row in timesheets:
+        work_date = row.get("work_date")
+        if not work_date:
+            continue
+        status = row.get("status")
+        if status == "rejected":
+            daily_status[work_date] = "Anomalia"
+        elif status == "submitted" and daily_status.get(work_date) != "Anomalia":
+            daily_status[work_date] = "Da approvare"
+        elif work_date not in daily_status:
+            daily_status[work_date] = "Regolare"
+
+    calendar_rows = []
+    cursor = month_start
+    while cursor < month_end:
+        calendar_rows.append({
+            "Data": cursor.isoformat(),
+            "Stato": daily_status.get(cursor.isoformat(), "Nessun dato"),
+        })
+        cursor += timedelta(days=1)
+
+    dept_hours = {}
+    for row in approved:
+        employee = employee_map.get(int(row["employee_id"]), {})
+        department = employee.get("department") or "Da assegnare"
+        worked = float(row.get("ordinary_hours") or 0) + float(row.get("overtime_hours") or 0)
+        dept_hours[department] = dept_hours.get(department, 0) + worked
+
+    return {
+        "active_employees": len(employees),
+        "present_now": len(present_ids),
+        "pending_count": len(pending),
+        "today_hours": today_hours,
+        "today_cost": today_cost,
+        "incidence": incidence,
+        "covers": covers,
+        "payslip_count": payslip_count,
+        "overtime_total": overtime_total,
+        "agenda": agenda,
+        "anomalies": anomalies,
+        "calendar_rows": calendar_rows,
+        "dept_hours": dept_hours,
+    }
+
+st.sidebar.title("RV Manager Enterprise")
+st.sidebar.caption("Enterprise 1.0 · Dashboard intelligente")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1120,81 +1286,99 @@ year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
 month = st.sidebar.selectbox("Mese", list(MONTHS), format_func=lambda x: MONTHS[x], index=today.month - 1)
 
 if section == "Cruscotto":
-    st.title("Cruscotto gestione personale")
-    st.caption(f"{MONTHS[month]} {year}")
+    st.title("RV Manager Enterprise")
+    st.caption(f"Centro operativo · {MONTHS[month]} {year}")
 
-    today_iso = date.today().isoformat()
-    month_start, month_end = month_bounds(year, month)
+    snapshot = manager_daily_snapshot(year, month)
 
-    today_entries = (
-        sb.table("clock_entries")
-        .select("employee_id,clock_in,clock_out,status")
-        .eq("work_date", today_iso)
-        .execute().data or []
-    )
-    present_now = sum(
-        1 for row in today_entries
-        if row.get("clock_in") and not row.get("clock_out")
-    )
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Presenti ora", f"{snapshot['present_now']} / {snapshot['active_employees']}")
+    c2.metric("Ore oggi", f"{snapshot['today_hours']:.2f}")
+    c3.metric("Costo oggi", euro(snapshot["today_cost"]))
+    c4.metric("Incidenza mese", f"{snapshot['incidence']:.1f}%")
+    c5.metric("Da approvare", snapshot["pending_count"])
+    c6.metric("Buste pubblicate", snapshot["payslip_count"])
 
-    pending_hours = (
-        sb.table("timesheets")
-        .select("id", count="exact")
-        .eq("status", "submitted")
-        .gte("work_date", month_start.isoformat())
-        .lt("work_date", month_end.isoformat())
-        .execute()
-    )
-    pending_count = pending_hours.count or 0
+    st.subheader("Centro operativo")
+    for task in snapshot["agenda"]:
+        st.write(f"• {task}")
 
-    published_payslips = (
-        sb.table("payslips")
-        .select("id", count="exact")
-        .eq("year", year)
-        .eq("month", month)
-        .eq("status", "published")
-        .execute()
-    )
-    payslip_count = published_payslips.count or 0
-
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Presenti adesso", present_now)
-    d2.metric("Ore da approvare", pending_count)
-    d3.metric("Buste paga pubblicate", payslip_count)
-
-    df, revenue, covers = month_data(year, month)
-    if df.empty:
-        st.info("Non risultano ancora costi importati per questo mese.")
+    if snapshot["anomalies"]:
+        st.subheader("Avvisi e anomalie")
+        st.dataframe(
+            pd.DataFrame(snapshot["anomalies"]),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
-        official = df["company_cost"].sum()
-        extra = df["extra_cash"].sum()
-        fringe = df["fringe"].sum()
-        total = df["management_cost"].sum()
-        hours = df["hours"].sum()
-        incidence = total / revenue * 100 if revenue else 0
+        st.success("Nessuna anomalia rilevata.")
 
-        a, b, c, d = st.columns(4)
-        a.metric("Costo aziendale", euro(official))
-        b.metric("Extra registrati", euro(extra))
-        c.metric("Fringe benefit", euro(fringe))
-        d.metric("Costo gestionale", euro(total))
+    tab1, tab2, tab3 = st.tabs(["Panoramica", "Calendario presenze", "Analisi"])
 
-        e, f, g, h = st.columns(4)
-        e.metric("Fatturato", euro(revenue))
-        f.metric("Incidenza personale", f"{incidence:.1f}%")
-        g.metric("Costo medio/ora", euro(total / hours) if hours else "Ore mancanti")
-        h.metric("Costo/coperto", euro(total / covers) if covers else "Coperti mancanti")
+    with tab1:
+        df, revenue, covers = month_data(year, month)
+        if df.empty:
+            st.info("Non risultano ancora costi importati per questo mese.")
+        else:
+            official = df["company_cost"].sum()
+            extra = df["extra_cash"].sum()
+            fringe = df["fringe"].sum()
+            total = df["management_cost"].sum()
+            hours = df["hours"].sum()
+            incidence = total / revenue * 100 if revenue else 0
 
-        st.subheader("Costo per reparto")
-        st.bar_chart(df.groupby("department")["management_cost"].sum())
+            a, b, c, d = st.columns(4)
+            a.metric("Costo aziendale", euro(official))
+            b.metric("Extra registrati", euro(extra))
+            c.metric("Fringe benefit", euro(fringe))
+            d.metric("Costo gestionale", euro(total))
 
-        view = df[["name", "department", "hours", "net_pay", "gross_pay",
-                   "company_cost", "fringe", "extra_cash", "management_cost"]].copy()
-        view.columns = ["Dipendente", "Reparto", "Ore", "Netto", "Lordo",
-                        "Costo azienda", "Fringe", "Extra", "Costo gestionale"]
-        for col in ["Netto", "Lordo", "Costo azienda", "Fringe", "Extra", "Costo gestionale"]:
-            view[col] = view[col].map(euro)
-        st.dataframe(view, use_container_width=True, hide_index=True)
+            e, f, g, h = st.columns(4)
+            e.metric("Fatturato", euro(revenue))
+            f.metric("Incidenza personale", f"{incidence:.1f}%")
+            g.metric("Costo medio/ora", euro(total / hours) if hours else "Ore mancanti")
+            h.metric("Costo/coperto", euro(total / covers) if covers else "Coperti mancanti")
+
+            st.subheader("Costo per reparto")
+            st.bar_chart(df.groupby("department")["management_cost"].sum())
+
+            view = df[[
+                "name", "department", "hours", "net_pay", "gross_pay",
+                "company_cost", "fringe", "extra_cash", "management_cost"
+            ]].copy()
+            view.columns = [
+                "Dipendente", "Reparto", "Ore", "Netto", "Lordo",
+                "Costo azienda", "Fringe", "Extra", "Costo gestionale"
+            ]
+            for column in [
+                "Netto", "Lordo", "Costo azienda",
+                "Fringe", "Extra", "Costo gestionale"
+            ]:
+                view[column] = view[column].map(euro)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+        st.subheader("Accesso rapido")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.info("👥 Dipendenti")
+        q2.info("⏰ Ore e approvazioni")
+        q3.info("📄 Buste paga")
+        q4.info("💰 Costi e analisi")
+
+    with tab2:
+        st.dataframe(
+            pd.DataFrame(snapshot["calendar_rows"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab3:
+        if snapshot["dept_hours"]:
+            st.subheader("Ore approvate per reparto")
+            st.bar_chart(pd.Series(snapshot["dept_hours"]).sort_values(ascending=False))
+        else:
+            st.info("Non ci sono ancora ore approvate nel mese selezionato.")
+        st.metric("Straordinari del mese", f"{snapshot['overtime_total']:.2f} ore")
+        st.metric("Coperti del mese", snapshot["covers"])
 
 elif section == "Importa costi":
     st.title("Importa prospetto costi paghe")

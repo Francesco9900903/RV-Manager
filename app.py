@@ -603,7 +603,18 @@ def payslip_download_url(storage_path, client):
     return getattr(result, "signed_url", None)
 
 
-st.sidebar.title("RV Manager")
+def employee_portal():
+    employee_id = st.session_state.employee_id
+    employee = (
+        public_sb.table("employees")
+        .select("name,department")
+        .eq("id", employee_id)
+        .single()
+        .execute()
+        .data
+    )
+
+    st.sidebar.title("RV Manager")
     st.sidebar.write(employee.get("name", "Dipendente"))
     st.sidebar.caption(employee.get("department") or "")
     if st.sidebar.button("Esci"):
@@ -948,6 +959,7 @@ def payslip_download_url(storage_path, client):
 
 
 st.sidebar.title("RV Manager")
+st.sidebar.caption("Versione 3.6 stabile")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",

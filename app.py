@@ -626,6 +626,14 @@ def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
             "status": "published",
         }, on_conflict="employee_id,year,month").execute()
 
+        sb.table("employee_notifications").insert({
+            "employee_id": employee_id,
+            "title": "Nuova busta paga disponibile",
+            "message": f"È disponibile la busta paga di {MONTHS[detected_month]} {detected_year}.",
+            "notification_type": "payslip",
+            "is_read": False,
+        }).execute()
+
         saved.append({
             "employee_id": employee_id,
             "year": detected_year,
@@ -678,9 +686,100 @@ def employee_portal():
         index=today.month - 1,
     )
 
-    tabs = st.tabs(["Timbratura", "Inserimento manuale", "Storico", "Buste paga"])
+    tabs = st.tabs(["Home", "Timbratura", "Inserimento manuale", "Storico", "Buste paga"])
 
     with tabs[0]:
+        st.title(f"Benvenuto, {employee.get('name', 'Dipendente').title()}")
+        st.caption(employee.get("department") or "Area personale")
+
+        start_date, end_date = month_bounds(selected_year, selected_month)
+
+        month_entries = (
+            public_sb.table("timesheets")
+            .select("ordinary_hours,overtime_hours,status,work_date")
+            .eq("employee_id", employee_id)
+            .gte("work_date", start_date.isoformat())
+            .lt("work_date", end_date.isoformat())
+            .execute().data or []
+        )
+
+        approved_entries = [
+            row for row in month_entries if row.get("status") == "approved"
+        ]
+        ordinary_total = sum(float(row.get("ordinary_hours") or 0) for row in approved_entries)
+        overtime_total = sum(float(row.get("overtime_hours") or 0) for row in approved_entries)
+        days_worked = len({row.get("work_date") for row in approved_entries if row.get("work_date")})
+
+        latest_payslip = (
+            public_sb.table("payslips")
+            .select("year,month,storage_path")
+            .eq("employee_id", employee_id)
+            .eq("status", "published")
+            .order("year", desc=True)
+            .order("month", desc=True)
+            .limit(1)
+            .execute().data or []
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Ore approvate", f"{ordinary_total + overtime_total:.2f}")
+        c2.metric("Straordinari", f"{overtime_total:.2f}")
+        c3.metric("Giorni registrati", days_worked)
+
+        st.subheader("Azioni rapide")
+        q1, q2 = st.columns(2)
+        q1.info("Usa la scheda **Timbratura** per registrare entrata e uscita.")
+        if latest_payslip:
+            document = latest_payslip[0]
+            period = f"{MONTHS[int(document['month'])]} {int(document['year'])}"
+            url = payslip_download_url(document["storage_path"], public_sb)
+            if url:
+                q2.link_button(
+                    f"Apri ultima busta paga · {period}",
+                    url,
+                    use_container_width=True,
+                )
+        else:
+            q2.info("Nessuna busta paga ancora disponibile.")
+
+        st.subheader("Calendario presenze")
+        calendar_rows = []
+        for row in sorted(month_entries, key=lambda x: x.get("work_date") or ""):
+            total = float(row.get("ordinary_hours") or 0) + float(row.get("overtime_hours") or 0)
+            calendar_rows.append({
+                "Giorno": row.get("work_date"),
+                "Ore": round(total, 2),
+                "Straordinario": round(float(row.get("overtime_hours") or 0), 2),
+                "Stato": row.get("status"),
+            })
+
+        if calendar_rows:
+            st.dataframe(
+                pd.DataFrame(calendar_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Nessuna presenza registrata per il mese selezionato.")
+
+        notifications = (
+            public_sb.table("employee_notifications")
+            .select("id,title,message,created_at,is_read")
+            .eq("employee_id", employee_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute().data or []
+        )
+        st.subheader("Notifiche")
+        if notifications:
+            for notice in notifications:
+                icon = "●" if not notice.get("is_read") else "○"
+                st.write(f"{icon} **{notice.get('title', 'Notifica')}**")
+                st.caption(notice.get("message") or "")
+        else:
+            st.info("Nessuna notifica.")
+
+    with tabs[1]:
         st.title("Timbratura")
         st.caption(f"{employee.get('name')} · {today.strftime('%d/%m/%Y')}")
 
@@ -732,7 +831,7 @@ def employee_portal():
             st.subheader("Timbrature di oggi")
             st.dataframe(pd.DataFrame(day_entries), use_container_width=True, hide_index=True)
 
-    with tabs[1]:
+    with tabs[2]:
         st.title("Inserimento manuale")
         st.caption("Usalo per recuperare una giornata non timbrata o correggere un'assenza di timbratura.")
 
@@ -765,7 +864,7 @@ def employee_portal():
                 }, on_conflict="employee_id,work_date").execute()
                 st.success("Ore inviate al responsabile.")
 
-    with tabs[2]:
+    with tabs[3]:
         st.title("Storico ore")
         st.caption(f"{MONTHS[selected_month]} {selected_year}")
         records = get_month_timesheets(
@@ -789,7 +888,7 @@ def employee_portal():
             b.metric("Ore approvate", f"{total_approved:.2f}")
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-    with tabs[3]:
+    with tabs[4]:
         st.title("Le mie buste paga")
         documents = (
             public_sb.table("payslips")
@@ -1007,7 +1106,7 @@ def payslip_download_url(storage_path, client):
 
 
 st.sidebar.title("RV Manager")
-st.sidebar.caption("Versione 3.8 fix pubblicazione")
+st.sidebar.caption("Versione 3.9 dashboard")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1023,6 +1122,45 @@ month = st.sidebar.selectbox("Mese", list(MONTHS), format_func=lambda x: MONTHS[
 if section == "Cruscotto":
     st.title("Cruscotto gestione personale")
     st.caption(f"{MONTHS[month]} {year}")
+
+    today_iso = date.today().isoformat()
+    month_start, month_end = month_bounds(year, month)
+
+    today_entries = (
+        sb.table("clock_entries")
+        .select("employee_id,clock_in,clock_out,status")
+        .eq("work_date", today_iso)
+        .execute().data or []
+    )
+    present_now = sum(
+        1 for row in today_entries
+        if row.get("clock_in") and not row.get("clock_out")
+    )
+
+    pending_hours = (
+        sb.table("timesheets")
+        .select("id", count="exact")
+        .eq("status", "submitted")
+        .gte("work_date", month_start.isoformat())
+        .lt("work_date", month_end.isoformat())
+        .execute()
+    )
+    pending_count = pending_hours.count or 0
+
+    published_payslips = (
+        sb.table("payslips")
+        .select("id", count="exact")
+        .eq("year", year)
+        .eq("month", month)
+        .eq("status", "published")
+        .execute()
+    )
+    payslip_count = published_payslips.count or 0
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Presenti adesso", present_now)
+    d2.metric("Ore da approvare", pending_count)
+    d3.metric("Buste paga pubblicate", payslip_count)
 
     df, revenue, covers = month_data(year, month)
     if df.empty:

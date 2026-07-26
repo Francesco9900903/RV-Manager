@@ -1,6 +1,6 @@
 
 import re
-from datetime import date
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
@@ -30,7 +30,7 @@ def parse_it_number(value):
         return 0.0
 
 @st.cache_resource
-def supabase():
+def supabase_admin():
     try:
         url = st.secrets["supabase"]["url"]
         key = st.secrets["supabase"]["secret_key"]
@@ -42,7 +42,94 @@ def supabase():
         st.stop()
     return create_client(url, key)
 
-sb = supabase()
+@st.cache_resource
+def supabase_public():
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["publishable_key"]
+    except Exception:
+        return None
+    return create_client(url, key)
+
+sb = supabase_admin()
+public_sb = supabase_public()
+
+def init_session():
+    defaults = {
+        "logged_in": False,
+        "user_role": "admin",
+        "employee_id": None,
+        "user_email": None,
+        "access_token": None,
+        "refresh_token": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session()
+
+def employee_login():
+    st.title("RV Manager")
+    st.subheader("Accesso dipendente")
+    st.caption("Inserisci email e password fornite dall'azienda.")
+    if public_sb is None:
+        st.error("Manca publishable_key nei Secrets di Streamlit.")
+        st.stop()
+
+    with st.form("employee_login_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Accedi", type="primary")
+
+    if submit:
+        try:
+            result = public_sb.auth.sign_in_with_password({
+                "email": email.strip(),
+                "password": password,
+            })
+            session = result.session
+            user = result.user
+            if not session or not user:
+                st.error("Accesso non riuscito.")
+                return
+
+            # Use the signed-in user's JWT for RLS-protected queries.
+            public_sb.auth.set_session(session.access_token, session.refresh_token)
+            account = (
+                public_sb.table("employee_accounts")
+                .select("employee_id,role")
+                .eq("auth_user_id", user.id)
+                .single()
+                .execute()
+                .data
+            )
+            st.session_state.logged_in = True
+            st.session_state.user_role = account.get("role", "employee")
+            st.session_state.employee_id = account.get("employee_id")
+            st.session_state.user_email = email.strip()
+            st.session_state.access_token = session.access_token
+            st.session_state.refresh_token = session.refresh_token
+            st.rerun()
+        except Exception:
+            st.error("Email, password o associazione dipendente non valide.")
+
+def restore_user_session():
+    if (
+        public_sb is not None
+        and st.session_state.get("logged_in")
+        and st.session_state.get("access_token")
+        and st.session_state.get("refresh_token")
+    ):
+        try:
+            public_sb.auth.set_session(
+                st.session_state.access_token,
+                st.session_state.refresh_token,
+            )
+        except Exception:
+            st.session_state.logged_in = False
+
+restore_user_session()
 
 def employees_df():
     data = (
@@ -231,11 +318,143 @@ def month_data(year, month):
     covers = int(rev[0]["covers"] or 0) if rev else 0
     return df, revenue, covers
 
+
+def month_bounds(year, month):
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, month + 1, 1)
+    return start, end
+
+def get_month_timesheets(employee_id, year, month, client=sb):
+    start, end = month_bounds(year, month)
+    return (
+        client.table("timesheets")
+        .select("id,work_date,ordinary_hours,overtime_hours,break_hours,shift_type,status,note")
+        .eq("employee_id", employee_id)
+        .gte("work_date", start.isoformat())
+        .lt("work_date", end.isoformat())
+        .order("work_date")
+        .execute()
+        .data or []
+    )
+
+def sync_monthly_hours(employee_id, year, month):
+    rows = get_month_timesheets(employee_id, year, month, sb)
+    total = sum(
+        float(r.get("ordinary_hours") or 0) + float(r.get("overtime_hours") or 0)
+        for r in rows
+        if r.get("status") == "approved"
+    )
+    sb.table("monthly_costs").upsert({
+        "employee_id": employee_id,
+        "year": year,
+        "month": month,
+        "hours": total,
+    }, on_conflict="employee_id,year,month").execute()
+    return total
+
+def employee_portal():
+    employee_id = st.session_state.employee_id
+    employee = (
+        public_sb.table("employees")
+        .select("name,department")
+        .eq("id", employee_id)
+        .single()
+        .execute()
+        .data
+    )
+
+    st.sidebar.title("RV Manager")
+    st.sidebar.write(employee.get("name", "Dipendente"))
+    st.sidebar.caption(employee.get("department") or "")
+    if st.sidebar.button("Esci"):
+        try:
+            public_sb.auth.sign_out()
+        except Exception:
+            pass
+        for key in ["logged_in", "employee_id", "access_token", "refresh_token", "user_email"]:
+            st.session_state[key] = None if key != "logged_in" else False
+        st.rerun()
+
+    today = date.today()
+    years = list(range(2025, today.year + 2))
+    selected_year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
+    selected_month = st.sidebar.selectbox(
+        "Mese", list(MONTHS),
+        format_func=lambda x: MONTHS[x],
+        index=today.month - 1,
+    )
+
+    st.title("Le mie ore")
+    st.caption(f"{employee.get('name')} · {MONTHS[selected_month]} {selected_year}")
+
+    with st.form("my_hours_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        work_date = c1.date_input("Giorno", value=today)
+        shift_type = c2.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
+        c3, c4, c5 = st.columns(3)
+        ordinary = c3.number_input("Ore ordinarie", min_value=0.0, max_value=24.0, step=0.25)
+        overtime = c4.number_input("Straordinario", min_value=0.0, max_value=12.0, step=0.25)
+        break_hours = c5.number_input("Pausa", min_value=0.0, max_value=8.0, step=0.25)
+        note = st.text_input("Nota")
+        submit = st.form_submit_button("Invia ore", type="primary")
+
+    if submit:
+        if work_date.year != selected_year or work_date.month != selected_month:
+            st.error("La data deve appartenere al mese selezionato.")
+        elif ordinary + overtime <= 0:
+            st.error("Inserisci almeno un'ora.")
+        else:
+            public_sb.table("timesheets").upsert({
+                "employee_id": employee_id,
+                "work_date": work_date.isoformat(),
+                "ordinary_hours": ordinary,
+                "overtime_hours": overtime,
+                "break_hours": break_hours,
+                "shift_type": shift_type,
+                "status": "submitted",
+                "note": note,
+            }, on_conflict="employee_id,work_date").execute()
+            st.success("Ore inviate al responsabile.")
+
+    records = get_month_timesheets(
+        employee_id, selected_year, selected_month, public_sb
+    )
+    df = pd.DataFrame(records)
+    if df.empty:
+        st.info("Non hai ancora inserito ore per questo mese.")
+    else:
+        total_submitted = (
+            df["ordinary_hours"].fillna(0).astype(float)
+            + df["overtime_hours"].fillna(0).astype(float)
+        ).sum()
+        approved = df.loc[df["status"] == "approved"]
+        total_approved = (
+            approved["ordinary_hours"].fillna(0).astype(float)
+            + approved["overtime_hours"].fillna(0).astype(float)
+        ).sum() if not approved.empty else 0
+        a, b = st.columns(2)
+        a.metric("Ore inserite", f"{total_submitted:.2f}")
+        b.metric("Ore approvate", f"{total_approved:.2f}")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# Employee login gate. The current Streamlit app can remain private during tests.
+if st.query_params.get("area") == "dipendente":
+    if not st.session_state.logged_in:
+        employee_login()
+        st.stop()
+    employee_portal()
+    st.stop()
+
+
 st.sidebar.title("RV Manager")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
-     "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
+     "Gestione ore", "Account dipendenti", "Fringe benefit",
+     "Extra da regolarizzare", "Dati del mese"]
 )
 
 today = date.today()
@@ -401,6 +620,114 @@ elif section == "Scheda dipendente":
         )
         st.subheader("Storico costi")
         st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
+
+
+elif section == "Gestione ore":
+    st.title("Gestione ore dipendenti")
+    employees = employees_df()
+    if employees.empty:
+        st.info("Nessun dipendente presente.")
+    else:
+        selected_name = st.selectbox("Dipendente", employees["name"].tolist())
+        employee_id = int(employees.loc[employees["name"] == selected_name, "id"].iloc[0])
+
+        tab1, tab2 = st.tabs(["Inserimento responsabile", "Approvazione ore"])
+
+        with tab1:
+            with st.form("admin_hours_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                work_date = c1.date_input("Giorno", value=date(year, month, 1))
+                shift_type = c2.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
+                c3, c4, c5 = st.columns(3)
+                ordinary = c3.number_input("Ore ordinarie", min_value=0.0, max_value=24.0, step=0.25)
+                overtime = c4.number_input("Straordinario", min_value=0.0, max_value=12.0, step=0.25)
+                break_hours = c5.number_input("Pausa", min_value=0.0, max_value=8.0, step=0.25)
+                note = st.text_input("Nota")
+                save = st.form_submit_button("Salva e approva", type="primary")
+
+            if save:
+                sb.table("timesheets").upsert({
+                    "employee_id": employee_id,
+                    "work_date": work_date.isoformat(),
+                    "ordinary_hours": ordinary,
+                    "overtime_hours": overtime,
+                    "break_hours": break_hours,
+                    "shift_type": shift_type,
+                    "status": "approved",
+                    "note": note,
+                    "approved_at": datetime.utcnow().isoformat(),
+                }, on_conflict="employee_id,work_date").execute()
+                total = sync_monthly_hours(
+                    employee_id, work_date.year, work_date.month
+                )
+                st.success(f"Ore salvate. Totale approvato del mese: {total:.2f}.")
+
+        with tab2:
+            records = get_month_timesheets(employee_id, year, month, sb)
+            df = pd.DataFrame(records)
+            if df.empty:
+                st.info("Nessuna ora presente per il mese selezionato.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                pending = [r for r in records if r.get("status") == "submitted"]
+                if pending:
+                    options = {
+                        f"{r['work_date']} · {float(r.get('ordinary_hours') or 0)+float(r.get('overtime_hours') or 0):.2f} ore": r["id"]
+                        for r in pending
+                    }
+                    selected = st.selectbox("Voce da approvare", list(options.keys()))
+                    c1, c2 = st.columns(2)
+                    if c1.button("Approva", type="primary"):
+                        sb.table("timesheets").update({
+                            "status": "approved",
+                            "approved_at": datetime.utcnow().isoformat(),
+                        }).eq("id", options[selected]).execute()
+                        total = sync_monthly_hours(employee_id, year, month)
+                        st.success(f"Approvata. Totale mensile: {total:.2f}.")
+                        st.rerun()
+                    if c2.button("Rifiuta"):
+                        sb.table("timesheets").update({
+                            "status": "rejected",
+                        }).eq("id", options[selected]).execute()
+                        st.warning("Voce rifiutata.")
+                        st.rerun()
+                else:
+                    st.success("Non ci sono ore in attesa di approvazione.")
+
+elif section == "Account dipendenti":
+    st.title("Account dipendenti")
+    st.info(
+        "Gli utenti vanno creati in Supabase → Authentication → Users. "
+        "Dopo la creazione, copia il loro User UID e associalo qui al dipendente."
+    )
+    employees = employees_df()
+    if employees.empty:
+        st.info("Nessun dipendente presente.")
+    else:
+        with st.form("link_account"):
+            selected_name = st.selectbox("Dipendente", employees["name"].tolist())
+            employee_id = int(employees.loc[employees["name"] == selected_name, "id"].iloc[0])
+            auth_uid = st.text_input("Supabase User UID")
+            role = st.selectbox("Ruolo", ["employee", "manager"])
+            save = st.form_submit_button("Associa account", type="primary")
+        if save:
+            try:
+                sb.table("employee_accounts").upsert({
+                    "auth_user_id": auth_uid.strip(),
+                    "employee_id": employee_id,
+                    "role": role,
+                }, on_conflict="auth_user_id").execute()
+                st.success("Account associato.")
+            except Exception as exc:
+                st.error(f"Associazione non riuscita: {exc}")
+
+        accounts = (
+            sb.table("employee_accounts")
+            .select("auth_user_id,role,employees(name,department)")
+            .execute().data or []
+        )
+        st.dataframe(pd.DataFrame(accounts), use_container_width=True, hide_index=True)
+
 
 elif section == "Fringe benefit":
     st.title("Fringe benefit")

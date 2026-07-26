@@ -42,6 +42,28 @@ MONTHS = {
     9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre"
 }
 
+
+ROME_TZ = ZoneInfo("Europe/Rome")
+UTC_TZ = ZoneInfo("UTC")
+
+def now_rome():
+    return datetime.now(ROME_TZ)
+
+def parse_db_datetime(value):
+    """
+    Supabase restituisce normalmente timestamp ISO in UTC.
+    Questa funzione li converte sempre in Europe/Rome.
+    """
+    if not value:
+        return None
+
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC_TZ)
+
+    return parsed.astimezone(ROME_TZ)
+
+
 def euro(v):
     v = float(v or 0)
     return f"€ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -812,18 +834,31 @@ def employee_portal():
         open_shift = current_open_shift(employee_id, public_sb)
 
         if open_shift:
-            started = datetime.fromisoformat(
-                open_shift["clock_in"].replace("Z", "+00:00")
-            )
+            started = parse_db_datetime(open_shift["clock_in"])
             local_started = started.astimezone()
 
             st.success(
                 f"Sei in servizio dalle {local_started.strftime('%H:%M')}."
             )
 
-            elapsed = datetime.now().astimezone() - local_started
-            elapsed_hours = max(elapsed.total_seconds() / 3600, 0)
-            st.metric("Tempo trascorso", f"{elapsed_hours:.2f} ore")
+            @st.fragment(run_every="30s")
+            def live_employee_elapsed():
+                elapsed = now_rome() - local_started
+                elapsed_hours = max(elapsed.total_seconds() / 3600, 0)
+                hours = int(elapsed.total_seconds() // 3600)
+                minutes = int((elapsed.total_seconds() % 3600) // 60)
+
+                c_elapsed, c_clock = st.columns(2)
+                c_elapsed.metric(
+                    "Tempo trascorso",
+                    f"{hours}h {minutes:02d}m",
+                )
+                c_clock.metric(
+                    "Ora attuale",
+                    now_rome().strftime("%H:%M"),
+                )
+
+            live_employee_elapsed()
 
             st.info(
                 "Quando hai terminato il turno, premi il pulsante rosso. "
@@ -850,7 +885,7 @@ def employee_portal():
                 type="primary",
                 use_container_width=True,
             ):
-                now = datetime.now().astimezone()
+                now = now_rome()
                 public_sb.table("clock_entries").update({
                     "clock_out": now.isoformat(),
                     "break_minutes": break_minutes,
@@ -887,7 +922,7 @@ def employee_portal():
                 type="primary",
                 use_container_width=True,
             ):
-                now = datetime.now().astimezone()
+                now = now_rome()
                 public_sb.table("clock_entries").insert({
                     "employee_id": employee_id,
                     "work_date": today.isoformat(),
@@ -915,16 +950,12 @@ def employee_portal():
             st.subheader("Timbrature di oggi")
             display_rows = []
             for entry in day_entries:
-                clock_in = datetime.fromisoformat(
-                    entry["clock_in"].replace("Z", "+00:00")
-                ).astimezone()
+                clock_in = parse_db_datetime(entry["clock_in"])
                 clock_out = None
                 worked_hours = None
 
                 if entry.get("clock_out"):
-                    clock_out = datetime.fromisoformat(
-                        entry["clock_out"].replace("Z", "+00:00")
-                    ).astimezone()
+                    clock_out = parse_db_datetime(entry["clock_out"])
                     minutes = int(
                         (clock_out - clock_in).total_seconds() // 60
                     ) - int(entry.get("break_minutes") or 0)
@@ -1273,6 +1304,17 @@ def manager_daily_snapshot(selected_year, selected_month):
         for r in today_rows
     )
 
+    # Aggiunge anche i turni ancora aperti, così il cruscotto cresce in tempo reale.
+    live_open_hours = 0.0
+    for row in open_entries:
+        started = parse_db_datetime(row.get("clock_in"))
+        if started:
+            live_open_hours += max(
+                (now_rome() - started).total_seconds() / 3600,
+                0,
+            )
+    today_hours += live_open_hours
+
     costs = (
         sb.table("monthly_costs")
         .select("company_cost")
@@ -1389,7 +1431,7 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.1 · Timbratura smart")
+st.sidebar.caption("Enterprise 1.2 · Orario Italia e live")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1408,13 +1450,27 @@ if section == "Cruscotto":
 
     snapshot = manager_daily_snapshot(year, month)
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Presenti ora", f"{snapshot['present_now']} / {snapshot['active_employees']}")
-    c2.metric("Ore oggi", f"{snapshot['today_hours']:.2f}")
-    c3.metric("Costo oggi", euro(snapshot["today_cost"]))
-    c4.metric("Incidenza mese", f"{snapshot['incidence']:.1f}%")
-    c5.metric("Da approvare", snapshot["pending_count"])
-    c6.metric("Buste pubblicate", snapshot["payslip_count"])
+    @st.fragment(run_every="30s")
+    def live_manager_metrics():
+        live_snapshot = manager_daily_snapshot(year, month)
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric(
+            "Presenti ora",
+            f"{live_snapshot['present_now']} / {live_snapshot['active_employees']}",
+        )
+        c2.metric("Ore oggi", f"{live_snapshot['today_hours']:.2f}")
+        c3.metric("Costo oggi", euro(live_snapshot["today_cost"]))
+        c4.metric("Incidenza mese", f"{live_snapshot['incidence']:.1f}%")
+        c5.metric("Da approvare", live_snapshot["pending_count"])
+        c6.metric("Buste pubblicate", live_snapshot["payslip_count"])
+
+        st.caption(
+            f"Aggiornato automaticamente alle {now_rome().strftime('%H:%M:%S')} "
+            "· fuso orario Europe/Rome"
+        )
+
+    live_manager_metrics()
 
     st.subheader("Centro operativo")
     for task in snapshot["agenda"]:
@@ -1433,9 +1489,7 @@ if section == "Cruscotto":
         current_view = []
         for row in current_rows:
             employee_data = row.get("employees") or {}
-            started = datetime.fromisoformat(
-                row["clock_in"].replace("Z", "+00:00")
-            ).astimezone()
+            started = parse_db_datetime(row["clock_in"])
             current_view.append({
                 "Dipendente": employee_data.get("name", ""),
                 "Reparto": employee_data.get("department", ""),
@@ -1693,7 +1747,7 @@ elif section == "Ore e approvazioni":
                     "shift_type": shift_type,
                     "status": "approved",
                     "note": note or "Inserimento rapido del responsabile",
-                    "approved_at": datetime.now().astimezone().isoformat(),
+                    "approved_at": now_rome().isoformat(),
                 }, on_conflict="employee_id,work_date").execute()
 
                 total = sync_monthly_hours(employee_id, work_date.year, work_date.month)
@@ -1739,7 +1793,7 @@ elif section == "Ore e approvazioni":
                     if c1.button("Approva", type="primary"):
                         sb.table("timesheets").update({
                             "status": "approved",
-                            "approved_at": datetime.now().astimezone().isoformat(),
+                            "approved_at": now_rome().isoformat(),
                         }).eq("id", options[selected]).execute()
                         total = sync_monthly_hours(employee_id, year, month)
                         st.success(f"Approvata. Totale mensile: {total:.2f} ore.")

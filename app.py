@@ -5,7 +5,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from supabase import create_client
 
 st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
@@ -425,7 +425,185 @@ def employee_portal():
         .data
     )
 
-    st.sidebar.title("RV Manager")
+    
+def normalize_person_name(value):
+    value = (value or "").upper().strip()
+    value = re.sub(r"[^A-ZÀ-ÖØ-Ý0-9 ]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+def detect_payslip_period(text, fallback_year, fallback_month):
+    patterns = [
+        r"(?:mese|periodo|competenza)\s*[:\-]?\s*([A-ZÀ-ÖØ-Ý]+)\s+(\d{4})",
+        r"(?:mese|periodo|competenza)\s*[:\-]?\s*(\d{1,2})[\/\-](\d{4})",
+        r"(\d{1,2})[\/\-](\d{4})",
+    ]
+    month_names = {normalize_person_name(v): k for k, v in MONTHS.items()}
+    upper = normalize_person_name(text)
+
+    m = re.search(patterns[0], upper, re.I)
+    if m:
+        month_value = month_names.get(normalize_person_name(m.group(1)))
+        if month_value:
+            return int(m.group(2)), month_value
+
+    for pattern in patterns[1:]:
+        m = re.search(pattern, text, re.I)
+        if m:
+            month_value = int(m.group(1))
+            year_value = int(m.group(2))
+            if 1 <= month_value <= 12 and 2020 <= year_value <= 2100:
+                return year_value, month_value
+
+    return fallback_year, fallback_month
+
+def employee_match_catalog():
+    employees = (
+        sb.table("employees")
+        .select("id,code,name")
+        .order("name")
+        .execute().data or []
+    )
+    profiles = (
+        sb.table("employee_profiles")
+        .select("employee_id,tax_code")
+        .execute().data or []
+    )
+    tax_map = {
+        int(p["employee_id"]): normalize_person_name(p.get("tax_code"))
+        for p in profiles if p.get("tax_code")
+    }
+
+    catalog = []
+    for employee in employees:
+        catalog.append({
+            "id": int(employee["id"]),
+            "code": normalize_person_name(employee.get("code")),
+            "name": normalize_person_name(employee.get("name")),
+            "tax_code": tax_map.get(int(employee["id"]), ""),
+        })
+    return catalog
+
+def match_employee_from_page(page_text, catalog):
+    normalized = normalize_person_name(page_text)
+    scored = []
+    for employee in catalog:
+        score = 0
+        if employee["tax_code"] and employee["tax_code"] in normalized:
+            score += 100
+        if employee["code"] and re.search(rf"\b{re.escape(employee['code'])}\b", normalized):
+            score += 35
+        if employee["name"] and employee["name"] in normalized:
+            score += 70
+        else:
+            name_parts = [p for p in employee["name"].split() if len(p) > 2]
+            matched_parts = sum(1 for p in name_parts if re.search(rf"\b{re.escape(p)}\b", normalized))
+            if name_parts and matched_parts == len(name_parts):
+                score += 50
+        if score:
+            scored.append((score, employee["id"]))
+
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
+    reader = PdfReader(BytesIO(uploaded_file.getvalue()))
+    catalog = employee_match_catalog()
+    if not catalog:
+        raise ValueError("Non risultano dipendenti nel gestionale.")
+
+    grouped_pages = {}
+    unresolved_pages = []
+    current_employee_id = None
+
+    for page_index, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        matched_employee_id = match_employee_from_page(page_text, catalog)
+
+        # Le pagine successive della stessa busta possono non ripetere il nome.
+        if matched_employee_id is not None:
+            current_employee_id = matched_employee_id
+
+        if current_employee_id is None:
+            unresolved_pages.append(page_index + 1)
+            continue
+
+        grouped_pages.setdefault(current_employee_id, []).append(page_index)
+
+    if not grouped_pages:
+        raise ValueError(
+            "Nessuna busta paga riconosciuta. Il PDF potrebbe essere una scansione "
+            "oppure avere un formato non ancora supportato."
+        )
+
+    full_text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    detected_year, detected_month = detect_payslip_period(
+        full_text, fallback_year, fallback_month
+    )
+
+    saved = []
+    for employee_id, page_indexes in grouped_pages.items():
+        writer = PdfWriter()
+        for page_index in page_indexes:
+            writer.add_page(reader.pages[page_index])
+
+        output = BytesIO()
+        writer.write(output)
+        output.seek(0)
+
+        storage_path = (
+            f"{employee_id}/{detected_year:04d}/"
+            f"{detected_month:02d}/busta_paga.pdf"
+        )
+
+        # Remove previous version, if present, then upload the replacement.
+        try:
+            sb.storage.from_("payslips").remove([storage_path])
+        except Exception:
+            pass
+
+        sb.storage.from_("payslips").upload(
+            storage_path,
+            output.getvalue(),
+            {
+                "content-type": "application/pdf",
+                "upsert": "true",
+            },
+        )
+
+        sb.table("payslips").upsert({
+            "employee_id": employee_id,
+            "year": detected_year,
+            "month": detected_month,
+            "storage_path": storage_path,
+            "original_file_name": uploaded_file.name,
+            "page_count": len(page_indexes),
+            "status": "published",
+        }, on_conflict="employee_id,year,month").execute()
+
+        saved.append({
+            "employee_id": employee_id,
+            "pages": [x + 1 for x in page_indexes],
+        })
+
+    return detected_year, detected_month, saved, unresolved_pages
+
+def payslip_download_url(storage_path, client):
+    result = client.storage.from_("payslips").create_signed_url(storage_path, 300)
+    if isinstance(result, dict):
+        return (
+            result.get("signedURL")
+            or result.get("signedUrl")
+            or result.get("signed_url")
+        )
+    return getattr(result, "signed_url", None)
+
+
+st.sidebar.title("RV Manager")
     st.sidebar.write(employee.get("name", "Dipendente"))
     st.sidebar.caption(employee.get("department") or "")
     if st.sidebar.button("Esci"):
@@ -446,7 +624,7 @@ def employee_portal():
         index=today.month - 1,
     )
 
-    tabs = st.tabs(["Timbratura", "Inserimento manuale", "Storico"])
+    tabs = st.tabs(["Timbratura", "Inserimento manuale", "Storico", "Buste paga"])
 
     with tabs[0]:
         st.title("Timbratura")
@@ -557,6 +735,31 @@ def employee_portal():
             b.metric("Ore approvate", f"{total_approved:.2f}")
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+    with tabs[3]:
+        st.title("Le mie buste paga")
+        documents = (
+            public_sb.table("payslips")
+            .select("year,month,storage_path,page_count,created_at")
+            .eq("employee_id", employee_id)
+            .eq("status", "published")
+            .order("year", desc=True)
+            .order("month", desc=True)
+            .execute().data or []
+        )
+        if not documents:
+            st.info("Non sono ancora disponibili buste paga.")
+        else:
+            for document in documents:
+                period = f"{MONTHS[int(document['month'])]} {int(document['year'])}"
+                c1, c2 = st.columns([3, 1])
+                c1.write(f"**{period}**")
+                c1.caption(f"{int(document.get('page_count') or 1)} pagina/e")
+                url = payslip_download_url(document["storage_path"], public_sb)
+                if url:
+                    c2.link_button("Apri PDF", url, use_container_width=True)
+                else:
+                    c2.warning("Link non disponibile")
+
 # Employee login gate. The current Streamlit app can remain private during tests.
 if st.query_params.get("area") == "dipendente":
     if not st.session_state.logged_in:
@@ -566,11 +769,189 @@ if st.query_params.get("area") == "dipendente":
     st.stop()
 
 
+
+def normalize_person_name(value):
+    value = (value or "").upper().strip()
+    value = re.sub(r"[^A-ZÀ-ÖØ-Ý0-9 ]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+def detect_payslip_period(text, fallback_year, fallback_month):
+    patterns = [
+        r"(?:mese|periodo|competenza)\s*[:\-]?\s*([A-ZÀ-ÖØ-Ý]+)\s+(\d{4})",
+        r"(?:mese|periodo|competenza)\s*[:\-]?\s*(\d{1,2})[\/\-](\d{4})",
+        r"(\d{1,2})[\/\-](\d{4})",
+    ]
+    month_names = {normalize_person_name(v): k for k, v in MONTHS.items()}
+    upper = normalize_person_name(text)
+
+    m = re.search(patterns[0], upper, re.I)
+    if m:
+        month_value = month_names.get(normalize_person_name(m.group(1)))
+        if month_value:
+            return int(m.group(2)), month_value
+
+    for pattern in patterns[1:]:
+        m = re.search(pattern, text, re.I)
+        if m:
+            month_value = int(m.group(1))
+            year_value = int(m.group(2))
+            if 1 <= month_value <= 12 and 2020 <= year_value <= 2100:
+                return year_value, month_value
+
+    return fallback_year, fallback_month
+
+def employee_match_catalog():
+    employees = (
+        sb.table("employees")
+        .select("id,code,name")
+        .order("name")
+        .execute().data or []
+    )
+    profiles = (
+        sb.table("employee_profiles")
+        .select("employee_id,tax_code")
+        .execute().data or []
+    )
+    tax_map = {
+        int(p["employee_id"]): normalize_person_name(p.get("tax_code"))
+        for p in profiles if p.get("tax_code")
+    }
+
+    catalog = []
+    for employee in employees:
+        catalog.append({
+            "id": int(employee["id"]),
+            "code": normalize_person_name(employee.get("code")),
+            "name": normalize_person_name(employee.get("name")),
+            "tax_code": tax_map.get(int(employee["id"]), ""),
+        })
+    return catalog
+
+def match_employee_from_page(page_text, catalog):
+    normalized = normalize_person_name(page_text)
+    scored = []
+    for employee in catalog:
+        score = 0
+        if employee["tax_code"] and employee["tax_code"] in normalized:
+            score += 100
+        if employee["code"] and re.search(rf"\b{re.escape(employee['code'])}\b", normalized):
+            score += 35
+        if employee["name"] and employee["name"] in normalized:
+            score += 70
+        else:
+            name_parts = [p for p in employee["name"].split() if len(p) > 2]
+            matched_parts = sum(1 for p in name_parts if re.search(rf"\b{re.escape(p)}\b", normalized))
+            if name_parts and matched_parts == len(name_parts):
+                score += 50
+        if score:
+            scored.append((score, employee["id"]))
+
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
+    reader = PdfReader(BytesIO(uploaded_file.getvalue()))
+    catalog = employee_match_catalog()
+    if not catalog:
+        raise ValueError("Non risultano dipendenti nel gestionale.")
+
+    grouped_pages = {}
+    unresolved_pages = []
+    current_employee_id = None
+
+    for page_index, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        matched_employee_id = match_employee_from_page(page_text, catalog)
+
+        # Le pagine successive della stessa busta possono non ripetere il nome.
+        if matched_employee_id is not None:
+            current_employee_id = matched_employee_id
+
+        if current_employee_id is None:
+            unresolved_pages.append(page_index + 1)
+            continue
+
+        grouped_pages.setdefault(current_employee_id, []).append(page_index)
+
+    if not grouped_pages:
+        raise ValueError(
+            "Nessuna busta paga riconosciuta. Il PDF potrebbe essere una scansione "
+            "oppure avere un formato non ancora supportato."
+        )
+
+    full_text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    detected_year, detected_month = detect_payslip_period(
+        full_text, fallback_year, fallback_month
+    )
+
+    saved = []
+    for employee_id, page_indexes in grouped_pages.items():
+        writer = PdfWriter()
+        for page_index in page_indexes:
+            writer.add_page(reader.pages[page_index])
+
+        output = BytesIO()
+        writer.write(output)
+        output.seek(0)
+
+        storage_path = (
+            f"{employee_id}/{detected_year:04d}/"
+            f"{detected_month:02d}/busta_paga.pdf"
+        )
+
+        # Remove previous version, if present, then upload the replacement.
+        try:
+            sb.storage.from_("payslips").remove([storage_path])
+        except Exception:
+            pass
+
+        sb.storage.from_("payslips").upload(
+            storage_path,
+            output.getvalue(),
+            {
+                "content-type": "application/pdf",
+                "upsert": "true",
+            },
+        )
+
+        sb.table("payslips").upsert({
+            "employee_id": employee_id,
+            "year": detected_year,
+            "month": detected_month,
+            "storage_path": storage_path,
+            "original_file_name": uploaded_file.name,
+            "page_count": len(page_indexes),
+            "status": "published",
+        }, on_conflict="employee_id,year,month").execute()
+
+        saved.append({
+            "employee_id": employee_id,
+            "pages": [x + 1 for x in page_indexes],
+        })
+
+    return detected_year, detected_month, saved, unresolved_pages
+
+def payslip_download_url(storage_path, client):
+    result = client.storage.from_("payslips").create_signed_url(storage_path, 300)
+    if isinstance(result, dict):
+        return (
+            result.get("signedURL")
+            or result.get("signedUrl")
+            or result.get("signed_url")
+        )
+    return getattr(result, "signed_url", None)
+
+
 st.sidebar.title("RV Manager")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
-     "Ore e approvazioni", "Accessi dipendenti", "Fringe benefit",
+     "Ore e approvazioni", "Accessi dipendenti", "Buste paga", "Fringe benefit",
      "Extra da regolarizzare", "Dati del mese"]
 )
 
@@ -902,6 +1283,91 @@ elif section == "Accessi dipendenti":
             st.dataframe(pd.DataFrame(accounts), use_container_width=True, hide_index=True)
         else:
             st.info("Non sono ancora stati creati account.")
+
+
+elif section == "Buste paga":
+    st.title("Buste paga")
+    st.caption(
+        "Carica il PDF cumulativo del commercialista. Il programma divide le pagine "
+        "e pubblica ogni documento nell'area privata del dipendente."
+    )
+    st.warning(
+        "Prima di caricare documenti reali, rigenera le chiavi Supabase già apparse "
+        "negli screenshot e aggiorna i Secrets di Streamlit."
+    )
+
+    uploaded = st.file_uploader("PDF cumulativo delle buste paga", type=["pdf"])
+    c1, c2 = st.columns(2)
+    fallback_year = c1.selectbox(
+        "Anno di riferimento",
+        list(range(2025, date.today().year + 2)),
+        index=list(range(2025, date.today().year + 2)).index(year),
+    )
+    fallback_month = c2.selectbox(
+        "Mese di riferimento",
+        list(MONTHS),
+        format_func=lambda x: MONTHS[x],
+        index=month - 1,
+    )
+    st.caption(
+        "Mese e anno vengono cercati nel PDF. Questi campi sono usati solo "
+        "se il periodo non è leggibile nel documento."
+    )
+
+    if uploaded and st.button("Dividi e pubblica", type="primary"):
+        try:
+            detected_year, detected_month, saved, unresolved = split_and_store_payslips(
+                uploaded, fallback_year, fallback_month
+            )
+            employee_names = {
+                int(row["id"]): row["name"]
+                for row in sb.table("employees").select("id,name").execute().data or []
+            }
+            st.success(
+                f"Pubblicate {len(saved)} buste paga per "
+                f"{MONTHS[detected_month]} {detected_year}."
+            )
+            result_rows = []
+            for item in saved:
+                result_rows.append({
+                    "Dipendente": employee_names.get(item["employee_id"], item["employee_id"]),
+                    "Pagine": ", ".join(map(str, item["pages"])),
+                    "Stato": "Pubblicata",
+                })
+            st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
+
+            if unresolved:
+                st.warning(
+                    "Pagine non riconosciute e non pubblicate: "
+                    + ", ".join(map(str, unresolved))
+                )
+        except Exception as exc:
+            st.error(f"Elaborazione non riuscita: {exc}")
+
+    st.divider()
+    st.subheader("Archivio pubblicato")
+    archive = (
+        sb.table("payslips")
+        .select("id,year,month,storage_path,page_count,status,employees(name)")
+        .order("year", desc=True)
+        .order("month", desc=True)
+        .execute().data or []
+    )
+    if archive:
+        archive_rows = []
+        for document in archive:
+            employee = document.get("employees") or {}
+            archive_rows.append({
+                "Dipendente": employee.get("name", ""),
+                "Periodo": f"{MONTHS[int(document['month'])]} {int(document['year'])}",
+                "Pagine": int(document.get("page_count") or 1),
+                "Stato": document.get("status"),
+                "Percorso": document.get("storage_path"),
+            })
+        st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Nessuna busta paga pubblicata.")
+
 
 elif section == "Fringe benefit":
     st.title("Fringe benefit")

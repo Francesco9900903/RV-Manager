@@ -10,6 +10,32 @@ from supabase import create_client
 
 st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    @media (max-width: 768px) {
+        .block-container {
+            padding-top: 1rem;
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(128,128,128,0.25);
+            border-radius: 12px;
+            padding: 10px;
+        }
+        .stButton > button {
+            min-height: 56px;
+            font-size: 1.05rem;
+            font-weight: 700;
+            border-radius: 14px;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 MONTHS = {
     1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile",
     5: "Maggio", 6: "Giugno", 7: "Luglio", 8: "Agosto",
@@ -780,33 +806,87 @@ def employee_portal():
             st.info("Nessuna notifica.")
 
     with tabs[1]:
-        st.title("Timbratura")
+        st.title("Timbratura smart")
         st.caption(f"{employee.get('name')} · {today.strftime('%d/%m/%Y')}")
 
         open_shift = current_open_shift(employee_id, public_sb)
+
         if open_shift:
-            started = datetime.fromisoformat(open_shift["clock_in"].replace("Z", "+00:00"))
-            st.success(f"Entrata registrata alle {started.astimezone().strftime('%H:%M')}")
+            started = datetime.fromisoformat(
+                open_shift["clock_in"].replace("Z", "+00:00")
+            )
+            local_started = started.astimezone()
+
+            st.success(
+                f"Sei in servizio dalle {local_started.strftime('%H:%M')}."
+            )
+
+            elapsed = datetime.now().astimezone() - local_started
+            elapsed_hours = max(elapsed.total_seconds() / 3600, 0)
+            st.metric("Tempo trascorso", f"{elapsed_hours:.2f} ore")
+
+            st.info(
+                "Quando hai terminato il turno, premi il pulsante rosso. "
+                "Potrai indicare la pausa prima della conferma."
+            )
+
             break_minutes = st.number_input(
-                "Pausa totale da sottrarre (minuti)",
+                "Pausa totale da sottrarre",
                 min_value=0,
                 max_value=480,
                 value=int(open_shift.get("break_minutes") or 0),
                 step=5,
+                format="%d",
+                help="Inserisci i minuti complessivi di pausa del turno.",
             )
-            if st.button("Registra uscita", type="primary", use_container_width=True):
+
+            note = st.text_input(
+                "Nota facoltativa",
+                placeholder="Esempio: servizio prolungato, sostituzione collega…",
+            )
+
+            if st.button(
+                "🔴 REGISTRA USCITA",
+                type="primary",
+                use_container_width=True,
+            ):
                 now = datetime.now().astimezone()
                 public_sb.table("clock_entries").update({
                     "clock_out": now.isoformat(),
                     "break_minutes": break_minutes,
                     "status": "submitted",
                 }).eq("id", open_shift["id"]).execute()
+
                 refresh_timesheet_from_clock(employee_id, today, public_sb)
-                st.success("Uscita registrata. Le ore sono state inviate al responsabile.")
+
+                if note.strip():
+                    public_sb.table("timesheets").update({
+                        "note": note.strip()
+                    }).eq("employee_id", employee_id).eq(
+                        "work_date", today.isoformat()
+                    ).execute()
+
+                st.success(
+                    "Uscita registrata. Le ore sono state inviate al responsabile."
+                )
                 st.rerun()
+
         else:
-            shift_type = st.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
-            if st.button("Registra entrata", type="primary", use_container_width=True):
+            st.info(
+                "Premi il pulsante verde quando inizi il turno. "
+                "Non devi compilare altri campi."
+            )
+
+            shift_type = st.selectbox(
+                "Tipo turno",
+                ["Pranzo", "Cena", "Spezzato", "Altro"],
+            )
+
+            if st.button(
+                "🟢 REGISTRA ENTRATA",
+                type="primary",
+                use_container_width=True,
+            ):
                 now = datetime.now().astimezone()
                 public_sb.table("clock_entries").insert({
                     "employee_id": employee_id,
@@ -815,7 +895,10 @@ def employee_portal():
                     "shift_type": shift_type,
                     "status": "open",
                 }).execute()
-                st.success("Entrata registrata.")
+
+                st.success(
+                    f"Entrata registrata alle {now.strftime('%H:%M')}."
+                )
                 st.rerun()
 
         day_entries = (
@@ -827,9 +910,43 @@ def employee_portal():
             .execute()
             .data or []
         )
+
         if day_entries:
             st.subheader("Timbrature di oggi")
-            st.dataframe(pd.DataFrame(day_entries), use_container_width=True, hide_index=True)
+            display_rows = []
+            for entry in day_entries:
+                clock_in = datetime.fromisoformat(
+                    entry["clock_in"].replace("Z", "+00:00")
+                ).astimezone()
+                clock_out = None
+                worked_hours = None
+
+                if entry.get("clock_out"):
+                    clock_out = datetime.fromisoformat(
+                        entry["clock_out"].replace("Z", "+00:00")
+                    ).astimezone()
+                    minutes = int(
+                        (clock_out - clock_in).total_seconds() // 60
+                    ) - int(entry.get("break_minutes") or 0)
+                    worked_hours = round(max(minutes, 0) / 60, 2)
+
+                display_rows.append({
+                    "Entrata": clock_in.strftime("%H:%M"),
+                    "Uscita": (
+                        clock_out.strftime("%H:%M")
+                        if clock_out else "In servizio"
+                    ),
+                    "Pausa (min)": int(entry.get("break_minutes") or 0),
+                    "Ore": worked_hours if worked_hours is not None else "",
+                    "Turno": entry.get("shift_type"),
+                    "Stato": entry.get("status"),
+                })
+
+            st.dataframe(
+                pd.DataFrame(display_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with tabs[2]:
         st.title("Inserimento manuale")
@@ -1272,7 +1389,7 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.0 · Dashboard intelligente")
+st.sidebar.caption("Enterprise 1.1 · Timbratura smart")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1302,6 +1419,35 @@ if section == "Cruscotto":
     st.subheader("Centro operativo")
     for task in snapshot["agenda"]:
         st.write(f"• {task}")
+
+    if snapshot["present_now"] > 0:
+        st.subheader("Personale attualmente in servizio")
+        current_rows = (
+            sb.table("clock_entries")
+            .select("employee_id,clock_in,shift_type,employees(name,department)")
+            .eq("work_date", date.today().isoformat())
+            .is_("clock_out", "null")
+            .order("clock_in")
+            .execute().data or []
+        )
+        current_view = []
+        for row in current_rows:
+            employee_data = row.get("employees") or {}
+            started = datetime.fromisoformat(
+                row["clock_in"].replace("Z", "+00:00")
+            ).astimezone()
+            current_view.append({
+                "Dipendente": employee_data.get("name", ""),
+                "Reparto": employee_data.get("department", ""),
+                "Entrata": started.strftime("%H:%M"),
+                "Turno": row.get("shift_type", ""),
+            })
+        if current_view:
+            st.dataframe(
+                pd.DataFrame(current_view),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if snapshot["anomalies"]:
         st.subheader("Avvisi e anomalie")

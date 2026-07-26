@@ -1,6 +1,6 @@
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from io import BytesIO
 
 import pandas as pd
@@ -355,6 +355,65 @@ def sync_monthly_hours(employee_id, year, month):
     }, on_conflict="employee_id,year,month").execute()
     return total
 
+
+def minutes_between(start_time, end_time):
+    start_dt = datetime.combine(date.today(), start_time)
+    end_dt = datetime.combine(date.today(), end_time)
+    if end_dt < start_dt:
+        end_dt += timedelta(days=1)
+    return int((end_dt - start_dt).total_seconds() // 60)
+
+def decimal_hours(total_minutes):
+    return round(total_minutes / 60, 2)
+
+def current_open_shift(employee_id, client):
+    data = (
+        client.table("clock_entries")
+        .select("*")
+        .eq("employee_id", employee_id)
+        .is_("clock_out", "null")
+        .order("clock_in", desc=True)
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    return data[0] if data else None
+
+def refresh_timesheet_from_clock(employee_id, work_date, client):
+    entries = (
+        client.table("clock_entries")
+        .select("clock_in,clock_out,break_minutes")
+        .eq("employee_id", employee_id)
+        .eq("work_date", work_date.isoformat())
+        .execute()
+        .data or []
+    )
+    total_minutes = 0
+    for entry in entries:
+        if not entry.get("clock_out"):
+            continue
+        start_dt = datetime.fromisoformat(entry["clock_in"].replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(entry["clock_out"].replace("Z", "+00:00"))
+        worked = int((end_dt - start_dt).total_seconds() // 60)
+        worked -= int(entry.get("break_minutes") or 0)
+        total_minutes += max(worked, 0)
+
+    if total_minutes <= 0:
+        return
+
+    hours = decimal_hours(total_minutes)
+    client.table("timesheets").upsert({
+        "employee_id": employee_id,
+        "work_date": work_date.isoformat(),
+        "ordinary_hours": min(hours, 8),
+        "overtime_hours": max(hours - 8, 0),
+        "break_hours": 0,
+        "shift_type": "Timbratura",
+        "status": "submitted",
+        "note": "Calcolato automaticamente dalle timbrature",
+    }, on_conflict="employee_id,work_date").execute()
+
+
 def employee_portal():
     employee_id = st.session_state.employee_id
     employee = (
@@ -387,58 +446,116 @@ def employee_portal():
         index=today.month - 1,
     )
 
-    st.title("Le mie ore")
-    st.caption(f"{employee.get('name')} · {MONTHS[selected_month]} {selected_year}")
+    tabs = st.tabs(["Timbratura", "Inserimento manuale", "Storico"])
 
-    with st.form("my_hours_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        work_date = c1.date_input("Giorno", value=today)
-        shift_type = c2.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
-        c3, c4, c5 = st.columns(3)
-        ordinary = c3.number_input("Ore ordinarie", min_value=0.0, max_value=24.0, step=0.25)
-        overtime = c4.number_input("Straordinario", min_value=0.0, max_value=12.0, step=0.25)
-        break_hours = c5.number_input("Pausa", min_value=0.0, max_value=8.0, step=0.25)
-        note = st.text_input("Nota")
-        submit = st.form_submit_button("Invia ore", type="primary")
+    with tabs[0]:
+        st.title("Timbratura")
+        st.caption(f"{employee.get('name')} · {today.strftime('%d/%m/%Y')}")
 
-    if submit:
-        if work_date.year != selected_year or work_date.month != selected_month:
-            st.error("La data deve appartenere al mese selezionato.")
-        elif ordinary + overtime <= 0:
-            st.error("Inserisci almeno un'ora.")
+        open_shift = current_open_shift(employee_id, public_sb)
+        if open_shift:
+            started = datetime.fromisoformat(open_shift["clock_in"].replace("Z", "+00:00"))
+            st.success(f"Entrata registrata alle {started.astimezone().strftime('%H:%M')}")
+            break_minutes = st.number_input(
+                "Pausa totale da sottrarre (minuti)",
+                min_value=0,
+                max_value=480,
+                value=int(open_shift.get("break_minutes") or 0),
+                step=5,
+            )
+            if st.button("Registra uscita", type="primary", use_container_width=True):
+                now = datetime.now().astimezone()
+                public_sb.table("clock_entries").update({
+                    "clock_out": now.isoformat(),
+                    "break_minutes": break_minutes,
+                    "status": "submitted",
+                }).eq("id", open_shift["id"]).execute()
+                refresh_timesheet_from_clock(employee_id, today, public_sb)
+                st.success("Uscita registrata. Le ore sono state inviate al responsabile.")
+                st.rerun()
         else:
-            public_sb.table("timesheets").upsert({
-                "employee_id": employee_id,
-                "work_date": work_date.isoformat(),
-                "ordinary_hours": ordinary,
-                "overtime_hours": overtime,
-                "break_hours": break_hours,
-                "shift_type": shift_type,
-                "status": "submitted",
-                "note": note,
-            }, on_conflict="employee_id,work_date").execute()
-            st.success("Ore inviate al responsabile.")
+            shift_type = st.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
+            if st.button("Registra entrata", type="primary", use_container_width=True):
+                now = datetime.now().astimezone()
+                public_sb.table("clock_entries").insert({
+                    "employee_id": employee_id,
+                    "work_date": today.isoformat(),
+                    "clock_in": now.isoformat(),
+                    "shift_type": shift_type,
+                    "status": "open",
+                }).execute()
+                st.success("Entrata registrata.")
+                st.rerun()
 
-    records = get_month_timesheets(
-        employee_id, selected_year, selected_month, public_sb
-    )
-    df = pd.DataFrame(records)
-    if df.empty:
-        st.info("Non hai ancora inserito ore per questo mese.")
-    else:
-        total_submitted = (
-            df["ordinary_hours"].fillna(0).astype(float)
-            + df["overtime_hours"].fillna(0).astype(float)
-        ).sum()
-        approved = df.loc[df["status"] == "approved"]
-        total_approved = (
-            approved["ordinary_hours"].fillna(0).astype(float)
-            + approved["overtime_hours"].fillna(0).astype(float)
-        ).sum() if not approved.empty else 0
-        a, b = st.columns(2)
-        a.metric("Ore inserite", f"{total_submitted:.2f}")
-        b.metric("Ore approvate", f"{total_approved:.2f}")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        day_entries = (
+            public_sb.table("clock_entries")
+            .select("clock_in,clock_out,break_minutes,shift_type,status")
+            .eq("employee_id", employee_id)
+            .eq("work_date", today.isoformat())
+            .order("clock_in")
+            .execute()
+            .data or []
+        )
+        if day_entries:
+            st.subheader("Timbrature di oggi")
+            st.dataframe(pd.DataFrame(day_entries), use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        st.title("Inserimento manuale")
+        st.caption("Usalo per recuperare una giornata non timbrata o correggere un'assenza di timbratura.")
+
+        with st.form("my_hours_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            work_date = c1.date_input("Giorno", value=today)
+            shift_type = c2.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"], key="manual_shift")
+            c3, c4, c5 = st.columns(3)
+            ordinary = c3.number_input("Ore ordinarie", min_value=0.0, max_value=24.0, step=0.25)
+            overtime = c4.number_input("Straordinario", min_value=0.0, max_value=12.0, step=0.25)
+            break_hours = c5.number_input("Pausa", min_value=0.0, max_value=8.0, step=0.25)
+            note = st.text_input("Motivo o nota")
+            submit = st.form_submit_button("Invia ore", type="primary")
+
+        if submit:
+            if work_date.year != selected_year or work_date.month != selected_month:
+                st.error("La data deve appartenere al mese selezionato.")
+            elif ordinary + overtime <= 0:
+                st.error("Inserisci almeno un'ora.")
+            else:
+                public_sb.table("timesheets").upsert({
+                    "employee_id": employee_id,
+                    "work_date": work_date.isoformat(),
+                    "ordinary_hours": ordinary,
+                    "overtime_hours": overtime,
+                    "break_hours": break_hours,
+                    "shift_type": shift_type,
+                    "status": "submitted",
+                    "note": note,
+                }, on_conflict="employee_id,work_date").execute()
+                st.success("Ore inviate al responsabile.")
+
+    with tabs[2]:
+        st.title("Storico ore")
+        st.caption(f"{MONTHS[selected_month]} {selected_year}")
+        records = get_month_timesheets(
+            employee_id, selected_year, selected_month, public_sb
+        )
+        df = pd.DataFrame(records)
+        if df.empty:
+            st.info("Non hai ancora inserito ore per questo mese.")
+        else:
+            total_submitted = (
+                df["ordinary_hours"].fillna(0).astype(float)
+                + df["overtime_hours"].fillna(0).astype(float)
+            ).sum()
+            approved = df.loc[df["status"] == "approved"]
+            total_approved = (
+                approved["ordinary_hours"].fillna(0).astype(float)
+                + approved["overtime_hours"].fillna(0).astype(float)
+            ).sum() if not approved.empty else 0
+            a, b = st.columns(2)
+            a.metric("Ore inserite", f"{total_submitted:.2f}")
+            b.metric("Ore approvate", f"{total_approved:.2f}")
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
 # Employee login gate. The current Streamlit app can remain private during tests.
 if st.query_params.get("area") == "dipendente":
@@ -453,7 +570,7 @@ st.sidebar.title("RV Manager")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
-     "Gestione ore", "Account dipendenti", "Fringe benefit",
+     "Ore e approvazioni", "Accessi dipendenti", "Fringe benefit",
      "Extra da regolarizzare", "Dati del mese"]
 )
 
@@ -622,8 +739,10 @@ elif section == "Scheda dipendente":
         st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
 
 
-elif section == "Gestione ore":
+elif section == "Ore e approvazioni":
     st.title("Gestione ore dipendenti")
+    st.caption("Inserisci entrata, uscita e pausa: il totale viene calcolato automaticamente.")
+
     employees = employees_df()
     if employees.empty:
         st.info("Nessun dipendente presente.")
@@ -631,38 +750,67 @@ elif section == "Gestione ore":
         selected_name = st.selectbox("Dipendente", employees["name"].tolist())
         employee_id = int(employees.loc[employees["name"] == selected_name, "id"].iloc[0])
 
-        tab1, tab2 = st.tabs(["Inserimento responsabile", "Approvazione ore"])
+        tab1, tab2 = st.tabs(["Inserimento rapido", "Approvazione ore"])
 
         with tab1:
-            with st.form("admin_hours_form", clear_on_submit=True):
+            with st.form("admin_hours_simple", clear_on_submit=False):
                 c1, c2 = st.columns(2)
                 work_date = c1.date_input("Giorno", value=date(year, month, 1))
                 shift_type = c2.selectbox("Turno", ["Pranzo", "Cena", "Spezzato", "Altro"])
+
                 c3, c4, c5 = st.columns(3)
-                ordinary = c3.number_input("Ore ordinarie", min_value=0.0, max_value=24.0, step=0.25)
-                overtime = c4.number_input("Straordinario", min_value=0.0, max_value=12.0, step=0.25)
-                break_hours = c5.number_input("Pausa", min_value=0.0, max_value=8.0, step=0.25)
+                start_time = c3.time_input("Entrata", value=time(9, 0))
+                end_time = c4.time_input("Uscita", value=time(17, 0))
+                break_minutes = c5.number_input(
+                    "Pausa (minuti)", min_value=0, max_value=480, value=0, step=5
+                )
+
                 note = st.text_input("Nota")
-                save = st.form_submit_button("Salva e approva", type="primary")
+                save = st.form_submit_button("Calcola, salva e approva", type="primary")
 
             if save:
+                gross_minutes = minutes_between(start_time, end_time)
+                worked_minutes = max(gross_minutes - int(break_minutes), 0)
+                total_hours = decimal_hours(worked_minutes)
+                ordinary_hours = min(total_hours, 8)
+                overtime_hours = max(round(total_hours - 8, 2), 0)
+
                 sb.table("timesheets").upsert({
                     "employee_id": employee_id,
                     "work_date": work_date.isoformat(),
-                    "ordinary_hours": ordinary,
-                    "overtime_hours": overtime,
-                    "break_hours": break_hours,
+                    "ordinary_hours": ordinary_hours,
+                    "overtime_hours": overtime_hours,
+                    "break_hours": round(break_minutes / 60, 2),
                     "shift_type": shift_type,
                     "status": "approved",
-                    "note": note,
-                    "approved_at": datetime.utcnow().isoformat(),
+                    "note": note or "Inserimento rapido del responsabile",
+                    "approved_at": datetime.now().astimezone().isoformat(),
                 }, on_conflict="employee_id,work_date").execute()
-                total = sync_monthly_hours(
-                    employee_id, work_date.year, work_date.month
+
+                total = sync_monthly_hours(employee_id, work_date.year, work_date.month)
+                st.success(
+                    f"Giornata salvata: {total_hours:.2f} ore "
+                    f"({ordinary_hours:.2f} ordinarie + {overtime_hours:.2f} straordinarie). "
+                    f"Totale approvato del mese: {total:.2f} ore."
                 )
-                st.success(f"Ore salvate. Totale approvato del mese: {total:.2f}.")
 
         with tab2:
+            st.subheader("Timbrature registrate")
+            start_date, end_date = month_bounds(year, month)
+            clock_rows = (
+                sb.table("clock_entries")
+                .select("id,work_date,clock_in,clock_out,break_minutes,shift_type,status")
+                .eq("employee_id", employee_id)
+                .gte("work_date", start_date.isoformat())
+                .lt("work_date", end_date.isoformat())
+                .order("work_date")
+                .execute().data or []
+            )
+            if clock_rows:
+                st.dataframe(pd.DataFrame(clock_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Nessuna timbratura registrata per il mese selezionato.")
+
             records = get_month_timesheets(employee_id, year, month, sb)
             df = pd.DataFrame(records)
             if df.empty:
@@ -672,7 +820,9 @@ elif section == "Gestione ore":
                 pending = [r for r in records if r.get("status") == "submitted"]
                 if pending:
                     options = {
-                        f"{r['work_date']} · {float(r.get('ordinary_hours') or 0)+float(r.get('overtime_hours') or 0):.2f} ore": r["id"]
+                        f"{r['work_date']} · "
+                        f"{float(r.get('ordinary_hours') or 0)+float(r.get('overtime_hours') or 0):.2f} ore":
+                        r["id"]
                         for r in pending
                     }
                     selected = st.selectbox("Voce da approvare", list(options.keys()))
@@ -680,10 +830,10 @@ elif section == "Gestione ore":
                     if c1.button("Approva", type="primary"):
                         sb.table("timesheets").update({
                             "status": "approved",
-                            "approved_at": datetime.utcnow().isoformat(),
+                            "approved_at": datetime.now().astimezone().isoformat(),
                         }).eq("id", options[selected]).execute()
                         total = sync_monthly_hours(employee_id, year, month)
-                        st.success(f"Approvata. Totale mensile: {total:.2f}.")
+                        st.success(f"Approvata. Totale mensile: {total:.2f} ore.")
                         st.rerun()
                     if c2.button("Rifiuta"):
                         sb.table("timesheets").update({
@@ -694,40 +844,64 @@ elif section == "Gestione ore":
                 else:
                     st.success("Non ci sono ore in attesa di approvazione.")
 
-elif section == "Account dipendenti":
+elif section == "Accessi dipendenti":
     st.title("Account dipendenti")
-    st.info(
-        "Gli utenti vanno creati in Supabase → Authentication → Users. "
-        "Dopo la creazione, copia il loro User UID e associalo qui al dipendente."
+    st.caption(
+        "Crea direttamente qui email e password temporanea. "
+        "Non è più necessario entrare in Supabase Authentication."
     )
+
     employees = employees_df()
     if employees.empty:
         st.info("Nessun dipendente presente.")
     else:
-        with st.form("link_account"):
+        with st.form("create_employee_account"):
             selected_name = st.selectbox("Dipendente", employees["name"].tolist())
             employee_id = int(employees.loc[employees["name"] == selected_name, "id"].iloc[0])
-            auth_uid = st.text_input("Supabase User UID")
+            email = st.text_input("Email di accesso")
+            password = st.text_input(
+                "Password temporanea",
+                type="password",
+                help="Almeno 8 caratteri. Comunicala direttamente al dipendente.",
+            )
             role = st.selectbox("Ruolo", ["employee", "manager"])
-            save = st.form_submit_button("Associa account", type="primary")
-        if save:
-            try:
-                sb.table("employee_accounts").upsert({
-                    "auth_user_id": auth_uid.strip(),
-                    "employee_id": employee_id,
-                    "role": role,
-                }, on_conflict="auth_user_id").execute()
-                st.success("Account associato.")
-            except Exception as exc:
-                st.error(f"Associazione non riuscita: {exc}")
+            create = st.form_submit_button("Crea account", type="primary")
+
+        if create:
+            if not email.strip() or len(password) < 8:
+                st.error("Inserisci un'email valida e una password di almeno 8 caratteri.")
+            else:
+                try:
+                    created = sb.auth.admin.create_user({
+                        "email": email.strip(),
+                        "password": password,
+                        "email_confirm": True,
+                    })
+                    user_id = created.user.id
+                    sb.table("employee_accounts").upsert({
+                        "auth_user_id": user_id,
+                        "employee_id": employee_id,
+                        "role": role,
+                    }, on_conflict="auth_user_id").execute()
+                    st.success(
+                        "Account creato. Il dipendente può accedere dall'indirizzo "
+                        "dell'app aggiungendo ?area=dipendente"
+                    )
+                except Exception as exc:
+                    st.error(f"Creazione non riuscita: {exc}")
+
+        st.subheader("Indirizzo area dipendente")
+        st.code("https://rv-manager.streamlit.app/?area=dipendente")
 
         accounts = (
             sb.table("employee_accounts")
             .select("auth_user_id,role,employees(name,department)")
             .execute().data or []
         )
-        st.dataframe(pd.DataFrame(accounts), use_container_width=True, hide_index=True)
-
+        if accounts:
+            st.dataframe(pd.DataFrame(accounts), use_container_width=True, hide_index=True)
+        else:
+            st.info("Non sono ancora stati creati account.")
 
 elif section == "Fringe benefit":
     st.title("Fringe benefit")

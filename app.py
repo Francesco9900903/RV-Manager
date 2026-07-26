@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
 
@@ -42,7 +43,6 @@ MONTHS = {
     9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre"
 }
 
-
 ROME_TZ = ZoneInfo("Europe/Rome")
 UTC_TZ = ZoneInfo("UTC")
 
@@ -50,17 +50,12 @@ def now_rome():
     return datetime.now(ROME_TZ)
 
 def parse_db_datetime(value):
-    """
-    Supabase restituisce normalmente timestamp ISO in UTC.
-    Questa funzione li converte sempre in Europe/Rome.
-    """
+    """Converte un timestamp Supabase/UTC nel fuso Europe/Rome."""
     if not value:
         return None
-
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC_TZ)
-
     return parsed.astimezone(ROME_TZ)
 
 
@@ -844,19 +839,13 @@ def employee_portal():
             @st.fragment(run_every="30s")
             def live_employee_elapsed():
                 elapsed = now_rome() - local_started
-                elapsed_hours = max(elapsed.total_seconds() / 3600, 0)
-                hours = int(elapsed.total_seconds() // 3600)
-                minutes = int((elapsed.total_seconds() % 3600) // 60)
+                elapsed_seconds = max(elapsed.total_seconds(), 0)
+                hours = int(elapsed_seconds // 3600)
+                minutes = int((elapsed_seconds % 3600) // 60)
 
                 c_elapsed, c_clock = st.columns(2)
-                c_elapsed.metric(
-                    "Tempo trascorso",
-                    f"{hours}h {minutes:02d}m",
-                )
-                c_clock.metric(
-                    "Ora attuale",
-                    now_rome().strftime("%H:%M"),
-                )
+                c_elapsed.metric("Tempo trascorso", f"{hours}h {minutes:02d}m")
+                c_clock.metric("Ora attuale", now_rome().strftime("%H:%M"))
 
             live_employee_elapsed()
 
@@ -1304,7 +1293,6 @@ def manager_daily_snapshot(selected_year, selected_month):
         for r in today_rows
     )
 
-    # Aggiunge anche i turni ancora aperti, così il cruscotto cresce in tempo reale.
     live_open_hours = 0.0
     for row in open_entries:
         started = parse_db_datetime(row.get("clock_in"))
@@ -1431,7 +1419,7 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.2 · Orario Italia e live")
+st.sidebar.caption("Enterprise 1.2.1 · Orario Italia live")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1466,8 +1454,7 @@ if section == "Cruscotto":
         c6.metric("Buste pubblicate", live_snapshot["payslip_count"])
 
         st.caption(
-            f"Aggiornato automaticamente alle {now_rome().strftime('%H:%M:%S')} "
-            "· fuso orario Europe/Rome"
+            f"Aggiornato alle {now_rome().strftime('%H:%M:%S')} · Europe/Rome"
         )
 
     live_manager_metrics()

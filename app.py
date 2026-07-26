@@ -602,10 +602,15 @@ def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
         except Exception:
             pass
 
+        # Supabase Storage richiede un oggetto file binario.
+        # Passare direttamente i bytes può causare errori nel multipart encoder.
+        pdf_file = BytesIO(output.getvalue())
+        pdf_file.name = "busta_paga.pdf"
+
         sb.storage.from_("payslips").upload(
-            storage_path,
-            output.getvalue(),
-            {
+            path=storage_path,
+            file=pdf_file,
+            file_options={
                 "content-type": "application/pdf",
                 "upsert": "true",
             },
@@ -959,10 +964,15 @@ def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
         except Exception:
             pass
 
+        # Supabase Storage richiede un oggetto file binario.
+        # Passare direttamente i bytes può causare errori nel multipart encoder.
+        pdf_file = BytesIO(output.getvalue())
+        pdf_file.name = "busta_paga.pdf"
+
         sb.storage.from_("payslips").upload(
-            storage_path,
-            output.getvalue(),
-            {
+            path=storage_path,
+            file=pdf_file,
+            file_options={
                 "content-type": "application/pdf",
                 "upsert": "true",
             },
@@ -997,7 +1007,7 @@ def payslip_download_url(storage_path, client):
 
 
 st.sidebar.title("RV Manager")
-st.sidebar.caption("Versione 3.7 cedolini reali")
+st.sidebar.caption("Versione 3.8 fix pubblicazione")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1399,7 +1409,10 @@ elif section == "Buste paga":
                     + ", ".join(map(str, unresolved))
                 )
         except Exception as exc:
-            st.error(f"Elaborazione non riuscita: {exc}")
+            st.error(f"Elaborazione non riuscita: {type(exc).__name__}: {exc}")
+            st.caption(
+                "Il PDF non viene pubblicato se l'elaborazione non termina correttamente."
+            )
 
     st.divider()
     st.subheader("Archivio pubblicato")

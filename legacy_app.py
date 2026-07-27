@@ -313,11 +313,15 @@ st.markdown(
 
     @media (max-width: 768px) {
         section[data-testid="stSidebar"] {
-            min-width: 82vw !important;
-            max-width: 82vw !important;
+            min-width: 230px !important;
+            max-width: 230px !important;
+            width: 230px !important;
         }
-
-        .block-container {
+        section[data-testid="stSidebar"] > d
+        width: 230px ! important;
+        }
+        
+  .block-container {
             padding-top: 0.8rem;
             padding-bottom: 5rem;
         }

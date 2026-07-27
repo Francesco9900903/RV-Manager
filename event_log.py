@@ -1,4 +1,19 @@
 from typing import Optional, Any
+from datetime import date, datetime
+from decimal import Decimal
+
+def _json_safe(value: Any):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 def log_event(
     sb,
@@ -19,21 +34,21 @@ def log_event(
         "actor_user_id": actor_user_id,
         "entity_type": entity_type,
         "entity_id": entity_id,
-        "details": details or {},
+        "details": _json_safe(details or {}),
         "severity": severity,
     }
     try:
         sb.table("audit_events").insert(payload).execute()
     except Exception:
-        # Il registro eventi non deve mai bloccare l'operazione principale.
+        # L'audit non deve bloccare mai l'operazione principale.
         pass
 
 def recent_events(sb, limit: int = 100):
     return (
         sb.table("audit_events")
         .select(
-            "id,event_type,title,severity,employee_id,entity_type,"
-            "entity_id,details,created_at,employees(name)"
+            "id,event_type,title,severity,employee_id,actor_user_id,"
+            "entity_type,entity_id,details,created_at,employees(name)"
         )
         .order("created_at", desc=True)
         .limit(limit)

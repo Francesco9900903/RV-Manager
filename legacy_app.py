@@ -7,9 +7,14 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client
-from ai_manager import build_personnel_insights
-from event_log import log_event, recent_events
-from ui import render_insight
+try:
+    from rv_manager.ai_manager import build_personnel_insights
+    from rv_manager.event_log import log_event, recent_events
+    from rv_manager.ui import render_insight
+except ModuleNotFoundError:
+    from ai_manager import build_personnel_insights
+    from event_log import log_event, recent_events
+    from ui import render_insight
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
@@ -97,8 +102,38 @@ def supabase_public():
         return None
     return create_client(url, key)
 
+
 sb = supabase_admin()
 public_sb = supabase_public()
+
+def current_actor_user_id():
+    try:
+        user = public_sb.auth.get_user()
+        return str(user.user.id) if user and user.user else None
+    except Exception:
+        return None
+
+def audit(
+    event_type,
+    title,
+    *,
+    employee_id=None,
+    entity_type=None,
+    entity_id=None,
+    details=None,
+    severity="info",
+):
+    log_event(
+        sb,
+        event_type,
+        title,
+        employee_id=employee_id,
+        actor_user_id=current_actor_user_id(),
+        entity_type=entity_type,
+        entity_id=str(entity_id) if entity_id is not None else None,
+        details=details or {},
+        severity=severity,
+    )
 
 def init_session():
     defaults = {
@@ -680,6 +715,19 @@ def split_and_store_payslips(uploaded_file, fallback_year, fallback_month):
             "is_read": False,
         }).execute()
 
+        audit(
+            "payslip_published",
+            "Busta paga pubblicata",
+            employee_id=employee_id,
+            entity_type="payslip",
+            entity_id=f"{detected_year}-{detected_month:02d}",
+            details={
+                "storage_path": storage_path,
+                "page_count": len(page_indexes),
+                "original_file_name": uploaded_file.name,
+            },
+        )
+
         saved.append({
             "employee_id": employee_id,
             "year": detected_year,
@@ -918,6 +966,17 @@ def employee_portal():
                         "work_date", today.isoformat()
                     ).execute()
 
+                audit(
+                    "clock_out",
+                    "Uscita registrata",
+                    employee_id=employee_id,
+                    entity_type="clock_entry",
+                    entity_id=open_shift["id"],
+                    details={
+                        "clock_out": now.isoformat(),
+                        "break_minutes": int(break_minutes),
+                    },
+                )
                 st.success(
                     "Uscita registrata. Le ore sono state inviate al responsabile."
                 )
@@ -948,6 +1007,14 @@ def employee_portal():
                     "status": "open",
                 }).execute()
 
+                audit(
+                    "clock_in",
+                    "Entrata registrata",
+                    employee_id=employee_id,
+                    entity_type="clock_entry",
+                    entity_id=today.isoformat(),
+                    details={"clock_in": now.isoformat(), "shift_type": shift_type},
+                )
                 st.success(
                     f"Entrata registrata alle {now.strftime('%H:%M')}."
                 )
@@ -1027,6 +1094,19 @@ def employee_portal():
                     "status": "submitted",
                     "note": note,
                 }, on_conflict="employee_id,work_date").execute()
+                audit(
+                    "timesheet_submitted",
+                    "Ore manuali inviate dal dipendente",
+                    employee_id=employee_id,
+                    entity_type="timesheet",
+                    entity_id=work_date.isoformat(),
+                    details={
+                        "ordinary_hours": ordinary,
+                        "overtime_hours": overtime,
+                        "break_hours": break_hours,
+                        "shift_type": shift_type,
+                    },
+                )
                 st.success("Ore inviate al responsabile.")
 
     with tabs[3]:
@@ -1964,7 +2044,7 @@ def personnel_bi_insights(current_period, previous_period_data):
     return insights
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 2.0 · Fondazione modulare")
+st.sidebar.caption("Enterprise 2.1 · Audit Engine")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Business Intelligence", "AI Manager", "Registro eventi",
@@ -2840,6 +2920,19 @@ elif section == "Ore e approvazioni":
                 }, on_conflict="employee_id,work_date").execute()
 
                 total = sync_monthly_hours(employee_id, work_date.year, work_date.month)
+                audit(
+                    "timesheet_admin_saved",
+                    "Ore inserite e approvate dal responsabile",
+                    employee_id=employee_id,
+                    entity_type="timesheet",
+                    entity_id=work_date.isoformat(),
+                    details={
+                        "ordinary_hours": ordinary_hours,
+                        "overtime_hours": overtime_hours,
+                        "break_minutes": int(break_minutes),
+                        "shift_type": shift_type,
+                    },
+                )
                 st.success(
                     f"Giornata salvata: {total_hours:.2f} ore "
                     f"({ordinary_hours:.2f} ordinarie + {overtime_hours:.2f} straordinarie). "
@@ -2885,12 +2978,28 @@ elif section == "Ore e approvazioni":
                             "approved_at": now_rome().isoformat(),
                         }).eq("id", options[selected]).execute()
                         total = sync_monthly_hours(employee_id, year, month)
+                        audit(
+                            "timesheet_approved",
+                            "Registrazione ore approvata",
+                            employee_id=employee_id,
+                            entity_type="timesheet",
+                            entity_id=options[selected],
+                            details={"year": year, "month": month, "monthly_total": total},
+                        )
                         st.success(f"Approvata. Totale mensile: {total:.2f} ore.")
                         st.rerun()
                     if c2.button("Rifiuta"):
                         sb.table("timesheets").update({
                             "status": "rejected",
                         }).eq("id", options[selected]).execute()
+                        audit(
+                            "timesheet_rejected",
+                            "Registrazione ore rifiutata",
+                            employee_id=employee_id,
+                            entity_type="timesheet",
+                            entity_id=options[selected],
+                            severity="warning",
+                        )
                         st.warning("Voce rifiutata.")
                         st.rerun()
                 else:
@@ -2935,6 +3044,14 @@ elif section == "Accessi dipendenti":
                         "employee_id": employee_id,
                         "role": role,
                     }, on_conflict="auth_user_id").execute()
+                    audit(
+                        "employee_account_created",
+                        "Account dipendente creato",
+                        employee_id=employee_id,
+                        entity_type="employee_account",
+                        entity_id=user_id,
+                        details={"email": email.strip(), "role": role},
+                    )
                     st.success(
                         "Account creato. Il dipendente può accedere dall'indirizzo "
                         "dell'app aggiungendo ?area=dipendente"
@@ -3185,6 +3302,20 @@ elif section == "Centro documenti":
                     "is_read": False,
                 }).execute()
 
+                audit(
+                    "employee_document_published",
+                    "Documento pubblicato nell'area dipendente",
+                    employee_id=employee_id,
+                    entity_type="employee_document",
+                    entity_id=storage_path,
+                    details={
+                        "title": title.strip(),
+                        "document_type": document_type,
+                        "document_date": document_date.isoformat(),
+                        "expiry_date": expiry_date.isoformat() if expiry_date else None,
+                        "original_file_name": uploaded_document.name,
+                    },
+                )
                 st.success(
                     "Documento pubblicato nell'area privata del dipendente."
                 )
@@ -3268,6 +3399,13 @@ elif section == "Centro documenti":
             sb.table("employee_documents").update({
                 "status": "archived"
             }).eq("id", selected_archive_id).execute()
+            audit(
+                "employee_document_archived",
+                "Documento dipendente archiviato",
+                entity_type="employee_document",
+                entity_id=selected_archive_id,
+                severity="warning",
+            )
             st.success("Documento archiviato.")
             st.rerun()
 
@@ -3372,6 +3510,13 @@ elif section == "Fringe benefit":
                 entity_type="fringe_benefit",
                 details={"amount": amount, "category": category},
             )
+            audit(
+                "fringe_benefit_created",
+                "Fringe benefit registrato",
+                employee_id=employee_id,
+                entity_type="fringe_benefit",
+                details={"amount": amount, "category": category},
+            )
             st.success("Fringe registrato.")
 
 elif section == "Extra da regolarizzare":
@@ -3403,6 +3548,14 @@ elif section == "Extra da regolarizzare":
                 details={"amount": amount, "reason": reason},
                 severity="warning",
             )
+            audit(
+                "extra_payment_created",
+                "Extra registrato",
+                employee_id=employee_id,
+                entity_type="extra_payment",
+                details={"amount": amount, "reason": reason},
+                severity="warning",
+            )
             st.success("Extra registrato.")
 
 elif section == "Dati del mese":
@@ -3425,6 +3578,13 @@ elif section == "Dati del mese":
         }, on_conflict="year,month").execute()
         log_event(
             sb,
+            "monthly_data_updated",
+            f"Dati mensili aggiornati: {MONTHS[month]} {year}",
+            entity_type="monthly_revenue",
+            entity_id=f"{year}-{month:02d}",
+            details={"revenue": new_revenue, "covers": new_covers},
+        )
+        audit(
             "monthly_data_updated",
             f"Dati mensili aggiornati: {MONTHS[month]} {year}",
             entity_type="monthly_revenue",

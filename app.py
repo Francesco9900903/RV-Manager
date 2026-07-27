@@ -696,6 +696,31 @@ def payslip_download_url(storage_path, client):
         )
     return getattr(result, "signed_url", None)
 
+def safe_storage_filename(filename):
+    filename = (filename or "documento").strip()
+    stem, dot, extension = filename.rpartition(".")
+    if not dot:
+        stem, extension = filename, ""
+    stem = normalize_person_name(stem).lower().replace(" ", "_")
+    stem = re.sub(r"[^a-z0-9_-]", "", stem) or "documento"
+    extension = re.sub(r"[^a-z0-9]", "", extension.lower())
+    return f"{stem}.{extension}" if extension else stem
+
+def employee_document_url(storage_path, client):
+    result = client.storage.from_("employee-documents").create_signed_url(
+        storage_path,
+        300,
+    )
+    if isinstance(result, dict):
+        return (
+            result.get("signedURL")
+            or result.get("signedUrl")
+            or result.get("signed_url")
+        )
+    return getattr(result, "signed_url", None)
+
+
+
 
 def employee_portal():
     employee_id = st.session_state.employee_id
@@ -729,7 +754,7 @@ def employee_portal():
         index=today.month - 1,
     )
 
-    tabs = st.tabs(["Home", "Timbratura", "Inserimento manuale", "Storico", "Buste paga"])
+    tabs = st.tabs(["Home", "Timbratura", "Inserimento manuale", "Storico", "Buste paga", "Documenti"])
 
     with tabs[0]:
         st.title(f"Benvenuto, {employee.get('name', 'Dipendente').title()}")
@@ -1049,6 +1074,77 @@ def employee_portal():
                     c2.link_button("Apri PDF", url, use_container_width=True)
                 else:
                     c2.warning("Link non disponibile")
+
+
+    with tabs[5]:
+        st.title("I miei documenti")
+        st.caption(
+            "Contratti, attestati, CU e altri documenti personali "
+            "pubblicati dal responsabile."
+        )
+
+        documents = (
+            public_sb.table("employee_documents")
+            .select(
+                "id,title,document_type,document_date,expiry_date,"
+                "storage_path,original_file_name,status,created_at"
+            )
+            .eq("employee_id", employee_id)
+            .eq("status", "published")
+            .order("document_date", desc=True)
+            .order("created_at", desc=True)
+            .execute().data or []
+        )
+
+        if not documents:
+            st.info("Non sono ancora disponibili documenti personali.")
+        else:
+            document_rows = []
+            for document in documents:
+                expiry = document.get("expiry_date") or ""
+                document_rows.append({
+                    "Documento": document.get("title"),
+                    "Categoria": document.get("document_type"),
+                    "Data": document.get("document_date") or "",
+                    "Scadenza": expiry,
+                    "File": document.get("original_file_name") or "",
+                })
+
+            st.dataframe(
+                pd.DataFrame(document_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Apri documento")
+            selected_document_id = st.selectbox(
+                "Seleziona",
+                [int(d["id"]) for d in documents],
+                format_func=lambda document_id: next(
+                    (
+                        f"{d['title']} · {d.get('document_type', '')}"
+                        for d in documents
+                        if int(d["id"]) == document_id
+                    ),
+                    str(document_id),
+                ),
+            )
+            selected_document = next(
+                d for d in documents if int(d["id"]) == selected_document_id
+            )
+            url = employee_document_url(
+                selected_document["storage_path"],
+                public_sb,
+            )
+            if url:
+                st.link_button(
+                    "Apri documento",
+                    url,
+                    use_container_width=True,
+                )
+            else:
+                st.warning("Il collegamento temporaneo non è disponibile.")
+
 
 # Employee login gate. The current Streamlit app can remain private during tests.
 if st.query_params.get("area") == "dipendente":
@@ -1419,12 +1515,12 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.2.1 · Orario Italia live")
+st.sidebar.caption("Enterprise 1.3 · Centro documenti")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
-     "Ore e approvazioni", "Accessi dipendenti", "Buste paga", "Fringe benefit",
-     "Extra da regolarizzare", "Dati del mese"]
+     "Ore e approvazioni", "Accessi dipendenti", "Buste paga", "Centro documenti",
+     "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
 )
 
 today = date.today()
@@ -1946,6 +2042,211 @@ elif section == "Buste paga":
         st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True)
     else:
         st.info("Nessuna busta paga pubblicata.")
+
+
+
+elif section == "Centro documenti":
+    st.title("Centro documenti")
+    st.caption(
+        "Carica contratti, CU, attestati e altri documenti. "
+        "Ogni file sarà visibile esclusivamente al dipendente selezionato."
+    )
+
+    employees = (
+        sb.table("employees")
+        .select("id,name,department")
+        .eq("active", True)
+        .order("name")
+        .execute().data or []
+    )
+
+    if not employees:
+        st.warning("Non risultano dipendenti attivi.")
+    else:
+        employee_by_id = {int(row["id"]): row for row in employees}
+        employee_id = st.selectbox(
+            "Dipendente",
+            list(employee_by_id),
+            format_func=lambda value: employee_by_id[value]["name"],
+        )
+
+        c1, c2 = st.columns(2)
+        document_type = c1.selectbox(
+            "Categoria",
+            [
+                "Contratto",
+                "CU",
+                "Attestato HACCP",
+                "Formazione",
+                "Visita medica",
+                "Certificato",
+                "Comunicazione",
+                "Altro",
+            ],
+        )
+        document_date = c2.date_input("Data documento", value=date.today())
+
+        c3, c4 = st.columns(2)
+        title = c3.text_input(
+            "Titolo",
+            placeholder="Esempio: Contratto di assunzione",
+        )
+        has_expiry = c4.checkbox("Documento con scadenza")
+
+        expiry_date = None
+        if has_expiry:
+            expiry_date = st.date_input(
+                "Data di scadenza",
+                value=date.today() + timedelta(days=365),
+            )
+
+        uploaded_document = st.file_uploader(
+            "Documento",
+            type=["pdf", "png", "jpg", "jpeg", "doc", "docx"],
+            key="employee_document_upload",
+        )
+
+        notes = st.text_area(
+            "Note interne facoltative",
+            placeholder="Queste note restano nel gestionale.",
+        )
+
+        if st.button(
+            "Pubblica nell'area dipendente",
+            type="primary",
+            disabled=not uploaded_document or not title.strip(),
+        ):
+            try:
+                safe_name = safe_storage_filename(uploaded_document.name)
+                storage_path = (
+                    f"{employee_id}/{document_date.year:04d}/"
+                    f"{document_date.month:02d}/"
+                    f"{now_rome().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
+                )
+
+                binary_file = BytesIO(uploaded_document.getvalue())
+                binary_file.name = safe_name
+
+                sb.storage.from_("employee-documents").upload(
+                    path=storage_path,
+                    file=binary_file,
+                    file_options={
+                        "content-type": uploaded_document.type
+                        or "application/octet-stream",
+                        "upsert": "false",
+                    },
+                )
+
+                sb.table("employee_documents").insert({
+                    "employee_id": employee_id,
+                    "title": title.strip(),
+                    "document_type": document_type,
+                    "document_date": document_date.isoformat(),
+                    "expiry_date": (
+                        expiry_date.isoformat() if expiry_date else None
+                    ),
+                    "storage_path": storage_path,
+                    "original_file_name": uploaded_document.name,
+                    "mime_type": uploaded_document.type,
+                    "notes": notes.strip() or None,
+                    "status": "published",
+                }).execute()
+
+                sb.table("employee_notifications").insert({
+                    "employee_id": employee_id,
+                    "title": "Nuovo documento disponibile",
+                    "message": (
+                        f"È stato pubblicato il documento: {title.strip()}."
+                    ),
+                    "notification_type": "document",
+                    "is_read": False,
+                }).execute()
+
+                st.success(
+                    "Documento pubblicato nell'area privata del dipendente."
+                )
+            except Exception as exc:
+                st.error(
+                    f"Pubblicazione non riuscita: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    st.divider()
+    st.subheader("Archivio documenti")
+
+    archive = (
+        sb.table("employee_documents")
+        .select(
+            "id,title,document_type,document_date,expiry_date,status,"
+            "original_file_name,storage_path,employees(name)"
+        )
+        .order("document_date", desc=True)
+        .execute().data or []
+    )
+
+    if not archive:
+        st.info("Nessun documento pubblicato.")
+    else:
+        archive_rows = []
+        for document in archive:
+            employee_data = document.get("employees") or {}
+            archive_rows.append({
+                "ID": int(document["id"]),
+                "Dipendente": employee_data.get("name", ""),
+                "Documento": document.get("title", ""),
+                "Categoria": document.get("document_type", ""),
+                "Data": document.get("document_date", ""),
+                "Scadenza": document.get("expiry_date") or "",
+                "Stato": document.get("status", ""),
+                "File": document.get("original_file_name", ""),
+            })
+
+        st.dataframe(
+            pd.DataFrame(archive_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selected_archive_id = st.selectbox(
+            "Documento da gestire",
+            [int(row["id"]) for row in archive],
+            format_func=lambda value: next(
+                (
+                    f"{row.get('title')} · "
+                    f"{(row.get('employees') or {}).get('name', '')}"
+                    for row in archive
+                    if int(row["id"]) == value
+                ),
+                str(value),
+            ),
+        )
+
+        selected_archive = next(
+            row for row in archive
+            if int(row["id"]) == selected_archive_id
+        )
+
+        a1, a2 = st.columns(2)
+        url = employee_document_url(
+            selected_archive["storage_path"],
+            sb,
+        )
+        if url:
+            a1.link_button(
+                "Apri documento",
+                url,
+                use_container_width=True,
+            )
+
+        if a2.button(
+            "Archivia documento",
+            use_container_width=True,
+        ):
+            sb.table("employee_documents").update({
+                "status": "archived"
+            }).eq("id", selected_archive_id).execute()
+            st.success("Documento archiviato.")
+            st.rerun()
 
 
 elif section == "Fringe benefit":

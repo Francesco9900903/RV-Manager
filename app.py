@@ -1083,8 +1083,11 @@ def employee_portal():
             "pubblicati dal responsabile."
         )
 
+        # Lettura server-side filtrata sull'employee_id autenticato.
+        # Evita che una policy RLS incompleta nasconda documenti validi,
+        # senza esporre file di altri dipendenti.
         documents = (
-            public_sb.table("employee_documents")
+            sb.table("employee_documents")
             .select(
                 "id,title,document_type,document_date,expiry_date,"
                 "storage_path,original_file_name,status,created_at"
@@ -1134,7 +1137,7 @@ def employee_portal():
             )
             url = employee_document_url(
                 selected_document["storage_path"],
-                public_sb,
+                sb,
             )
             if url:
                 st.link_button(
@@ -1143,7 +1146,7 @@ def employee_portal():
                     use_container_width=True,
                 )
             else:
-                st.warning("Il collegamento temporaneo non è disponibile.")
+                st.warning("Documento trovato, ma il collegamento temporaneo non è disponibile.")
 
 
 # Employee login gate. The current Streamlit app can remain private during tests.
@@ -1515,7 +1518,7 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.3 · Centro documenti")
+st.sidebar.caption("Enterprise 1.3.1 · Fix documenti privati")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",

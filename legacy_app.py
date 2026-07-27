@@ -17,27 +17,265 @@ except ModuleNotFoundError:
     from ui import render_insight
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")
+st.set_page_config(page_title="RV Manager Enterprise", page_icon="◈", layout="wide")
 
 st.markdown(
     """
     <style>
-    @media (max-width: 768px) {
+    :root {
+        --rv-navy: #172033;
+        --rv-navy-soft: #24304a;
+        --rv-surface: #ffffff;
+        --rv-background: #f4f6f9;
+        --rv-border: #e3e8ef;
+        --rv-text: #1f2937;
+        --rv-muted: #667085;
+        --rv-accent: #c83b4d;
+        --rv-success: #087a55;
+        --rv-warning: #b5680b;
+        --rv-danger: #b42318;
+        --rv-radius: 14px;
+        --rv-shadow: 0 8px 26px rgba(23, 32, 51, 0.07);
+    }
+
+    html, body, [class*="css"] {
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI",
+                     Roboto, Helvetica, Arial, sans-serif;
+        color: var(--rv-text);
+    }
+
+    .stApp {
+        background: var(--rv-background);
+    }
+
+    /* Area principale */
+    .block-container {
+        max-width: 1480px;
+        padding-top: 2rem;
+        padding-bottom: 4rem;
+    }
+
+    h1, h2, h3 {
+        color: var(--rv-navy);
+        letter-spacing: -0.025em;
+    }
+
+    h1 {
+        font-weight: 760;
+        margin-bottom: 0.15rem;
+    }
+
+    h2, h3 {
+        font-weight: 700;
+    }
+
+    p, label, .stCaption {
+        color: var(--rv-muted);
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #172033 0%, #202b42 100%);
+        border-right: 0;
+    }
+
+    section[data-testid="stSidebar"] > div {
+        padding-top: 1rem;
+    }
+
+    section[data-testid="stSidebar"] * {
+        color: #f8fafc;
+    }
+
+    section[data-testid="stSidebar"] label {
+        color: #d7deea !important;
+        font-weight: 600;
+    }
+
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: rgba(255,255,255,0.08);
+        border-color: rgba(255,255,255,0.15);
+        border-radius: 10px;
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] {
+        gap: 0.22rem;
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] label {
+        border-radius: 10px;
+        padding: 0.52rem 0.65rem;
+        transition: background 0.15s ease, transform 0.15s ease;
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+        background: rgba(255,255,255,0.08);
+        transform: translateX(2px);
+    }
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+        background: rgba(255,255,255,0.14);
+        box-shadow: inset 3px 0 0 var(--rv-accent);
+    }
+
+    .rv-brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin: 0.25rem 0 1.2rem 0;
+        padding: 0.25rem 0.25rem 0.9rem 0.25rem;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    .rv-brand-mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 12px;
+        display: grid;
+        place-items: center;
+        background: linear-gradient(135deg, #d84b5d, #a9273a);
+        color: white;
+        font-weight: 800;
+        box-shadow: 0 8px 18px rgba(0,0,0,0.18);
+    }
+
+    .rv-brand-title {
+        color: white;
+        font-size: 1.03rem;
+        font-weight: 760;
+        line-height: 1.15;
+    }
+
+    .rv-brand-subtitle {
+        color: #aeb9ca;
+        font-size: 0.72rem;
+        margin-top: 0.16rem;
+    }
+
+    /* Metriche come card */
+    div[data-testid="stMetric"] {
+        background: var(--rv-surface);
+        border: 1px solid var(--rv-border);
+        border-radius: var(--rv-radius);
+        padding: 1rem 1.05rem;
+        min-height: 112px;
+        box-shadow: var(--rv-shadow);
+    }
+
+    div[data-testid="stMetricLabel"] {
+        color: var(--rv-muted);
+        font-size: 0.82rem;
+        font-weight: 650;
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: var(--rv-navy);
+        font-weight: 760;
+        letter-spacing: -0.025em;
+    }
+
+    /* Tabelle e grafici */
+    div[data-testid="stDataFrame"],
+    div[data-testid="stTable"],
+    div[data-testid="stVegaLiteChart"],
+    div[data-testid="stArrowVegaLiteChart"] {
+        background: var(--rv-surface);
+        border: 1px solid var(--rv-border);
+        border-radius: var(--rv-radius);
+        padding: 0.45rem;
+        box-shadow: var(--rv-shadow);
+        overflow: hidden;
+    }
+
+    /* Tabs */
+    button[data-baseweb="tab"] {
+        color: var(--rv-muted);
+        font-weight: 650;
+        padding-left: 0.9rem;
+        padding-right: 0.9rem;
+    }
+
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: var(--rv-accent);
+    }
+
+    div[data-baseweb="tab-highlight"] {
+        background-color: var(--rv-accent);
+    }
+
+    /* Input */
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="textarea"] > div,
+    div[data-baseweb="select"] > div,
+    .stDateInput > div > div {
+        border-radius: 10px;
+        border-color: var(--rv-border);
+        background: #fff;
+    }
+
+    /* Pulsanti */
+    .stButton > button,
+    .stDownloadButton > button,
+    a[data-testid="stLinkButton"] {
+        min-height: 44px;
+        border-radius: 10px;
+        font-weight: 700;
+        border: 1px solid var(--rv-border);
+        transition: transform 0.14s ease, box-shadow 0.14s ease;
+    }
+
+    .stButton > button:hover,
+    .stDownloadButton > button:hover,
+    a[data-testid="stLinkButton"]:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 16px rgba(23,32,51,0.11);
+    }
+
+    button[kind="primary"] {
+        background: var(--rv-accent);
+        border-color: var(--rv-accent);
+        color: white;
+    }
+
+    /* Alert */
+    div[data-testid="stAlert"] {
+        border-radius: 12px;
+        border-width: 1px;
+        box-shadow: 0 4px 16px rgba(23,32,51,0.04);
+    }
+
+    /* File uploader */
+    section[data-testid="stFileUploaderDropzone"] {
+        background: #fff;
+        border: 1px dashed #bac4d2;
+        border-radius: 12px;
+    }
+
+    /* Header Streamlit più discreto */
+    header[data-testid="stHeader"] {
+        background: transparent;
+    }
+
+    #MainMenu, footer {
+        visibility: hidden;
+    }
+
+    /* Responsive */
+    @media (max-width: 900px) {
         .block-container {
-            padding-top: 1rem;
-            padding-left: 0.8rem;
-            padding-right: 0.8rem;
+            padding-top: 1.15rem;
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
         }
+
         div[data-testid="stMetric"] {
-            border: 1px solid rgba(128,128,128,0.25);
-            border-radius: 12px;
-            padding: 10px;
+            min-height: 100px;
+            padding: 0.8rem;
         }
+
         .stButton > button {
-            min-height: 56px;
-            font-size: 1.05rem;
-            font-weight: 700;
-            border-radius: 14px;
+            min-height: 52px;
+            font-size: 1rem;
         }
     }
     </style>
@@ -784,7 +1022,18 @@ def employee_portal():
         .data
     )
 
-    st.sidebar.title("RV Manager")
+    st.sidebar.markdown(
+        """
+        <div class="rv-brand">
+            <div class="rv-brand-mark">RV</div>
+            <div>
+                <div class="rv-brand-title">Area dipendente</div>
+                <div class="rv-brand-subtitle">RV Manager Enterprise</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.sidebar.write(employee.get("name", "Dipendente"))
     st.sidebar.caption(employee.get("department") or "")
     if st.sidebar.button("Esci"):
@@ -2043,15 +2292,60 @@ def personnel_bi_insights(current_period, previous_period_data):
 
     return insights
 
-st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 2.1 · Audit Engine")
+st.sidebar.markdown(
+    """
+    <div class="rv-brand">
+        <div class="rv-brand-mark">RV</div>
+        <div>
+            <div class="rv-brand-title">RV Manager</div>
+            <div class="rv-brand-subtitle">Enterprise 3.0</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+MENU_ICONS = {
+    "Cruscotto": "⌂",
+    "Business Intelligence": "▥",
+    "AI Manager": "✦",
+    "Registro eventi": "≡",
+    "Importa costi": "⇧",
+    "Dipendenti": "◉",
+    "Scheda dipendente": "◎",
+    "Ore e approvazioni": "◷",
+    "Accessi dipendenti": "◇",
+    "Buste paga": "▤",
+    "Centro documenti": "□",
+    "Centro notifiche": "●",
+    "Fringe benefit": "◆",
+    "Extra da regolarizzare": "△",
+    "Dati del mese": "▦",
+}
+
+MENU_ITEMS = [
+    "Cruscotto",
+    "Business Intelligence",
+    "AI Manager",
+    "Registro eventi",
+    "Importa costi",
+    "Dipendenti",
+    "Scheda dipendente",
+    "Ore e approvazioni",
+    "Accessi dipendenti",
+    "Buste paga",
+    "Centro documenti",
+    "Centro notifiche",
+    "Fringe benefit",
+    "Extra da regolarizzare",
+    "Dati del mese",
+]
+
 section = st.sidebar.radio(
-    "Personale",
-    ["Cruscotto", "Business Intelligence", "AI Manager", "Registro eventi",
-     "Importa costi", "Dipendenti", "Scheda dipendente", "Ore e approvazioni",
-     "Accessi dipendenti", "Buste paga", "Centro documenti",
-     "Centro notifiche", "Fringe benefit", "Extra da regolarizzare",
-     "Dati del mese"]
+    "Navigazione",
+    MENU_ITEMS,
+    format_func=lambda item: f"{MENU_ICONS[item]}  {item}",
+    label_visibility="collapsed",
 )
 
 today = date.today()
@@ -2060,8 +2354,11 @@ year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
 month = st.sidebar.selectbox("Mese", list(MONTHS), format_func=lambda x: MONTHS[x], index=today.month - 1)
 
 if section == "Cruscotto":
-    st.title("Cruscotto direzionale")
-    st.caption(f"RV Manager Enterprise · {MONTHS[month]} {year}")
+    st.title("Dashboard direzionale")
+    st.caption(
+        f"Panoramica operativa e indicatori del personale · "
+        f"{MONTHS[month]} {year}"
+    )
 
     snapshot = manager_daily_snapshot(year, month)
     absence_snapshot = executive_absence_snapshot(year, month)

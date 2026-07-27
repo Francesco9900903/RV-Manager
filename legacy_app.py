@@ -260,6 +260,107 @@ st.markdown(
         visibility: hidden;
     }
 
+
+    /* Mobile employee experience */
+    .rv-mobile-hero {
+        background: linear-gradient(135deg, #172033 0%, #24304a 100%);
+        color: white;
+        border-radius: 18px;
+        padding: 1rem 1rem 1.1rem 1rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 10px 26px rgba(23,32,51,0.14);
+    }
+
+    .rv-mobile-hero h2 {
+        color: white;
+        margin: 0;
+        font-size: 1.25rem;
+    }
+
+    .rv-mobile-hero p {
+        color: #d7deea;
+        margin: 0.35rem 0 0 0;
+        font-size: 0.9rem;
+    }
+
+    .rv-quick-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.7rem;
+        margin-bottom: 1rem;
+    }
+
+    .rv-quick-card {
+        background: #fff;
+        border: 1px solid var(--rv-border);
+        border-radius: 14px;
+        padding: 0.9rem;
+        box-shadow: var(--rv-shadow);
+    }
+
+    .rv-quick-label {
+        color: var(--rv-muted);
+        font-size: 0.76rem;
+        font-weight: 650;
+    }
+
+    .rv-quick-value {
+        color: var(--rv-navy);
+        font-size: 1.15rem;
+        font-weight: 760;
+        margin-top: 0.15rem;
+    }
+
+    @media (max-width: 768px) {
+        section[data-testid="stSidebar"] {
+            min-width: 82vw !important;
+            max-width: 82vw !important;
+        }
+
+        .block-container {
+            padding-top: 0.8rem;
+            padding-bottom: 5rem;
+        }
+
+        h1 {
+            font-size: 1.8rem;
+        }
+
+        h2 {
+            font-size: 1.35rem;
+        }
+
+        div[data-testid="column"] {
+            min-width: 100% !important;
+        }
+
+        [data-testid="stHorizontalBlock"] {
+            gap: 0.55rem;
+        }
+
+        div[data-testid="stMetric"] {
+            min-height: 92px;
+        }
+
+        div[data-testid="stDataFrame"] {
+            overflow-x: auto;
+        }
+
+        button[data-baseweb="tab"] {
+            font-size: 0.78rem;
+            padding-left: 0.55rem;
+            padding-right: 0.55rem;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button,
+        a[data-testid="stLinkButton"] {
+            width: 100%;
+            min-height: 54px;
+            font-size: 1rem;
+        }
+    }
+
     /* Responsive */
     @media (max-width: 900px) {
         .block-container {
@@ -1054,9 +1155,90 @@ def employee_portal():
         index=today.month - 1,
     )
 
-    tabs = st.tabs(["Home", "Timbratura", "Inserimento manuale", "Storico", "Buste paga", "Documenti"])
+    tabs = st.tabs(["⌂ Home", "◷ Timbratura", "✎ Manuale", "≡ Storico", "▤ Buste paga", "□ Documenti"])
+
+    with st.expander("Installa sul telefono"):
+        st.markdown(
+            """
+            **iPhone/iPad:** apri il menu Condividi di Safari e scegli
+            **Aggiungi alla schermata Home**.
+
+            **Android:** apri il menu di Chrome e scegli
+            **Aggiungi a schermata Home** oppure **Installa app**.
+
+            L'app resta una web app: per timbrare e consultare documenti serve
+            una connessione internet.
+            """
+        )
+
 
     with tabs[0]:
+        st.markdown(
+            f"""
+            <div class="rv-mobile-hero">
+                <h2>Ciao, {employee.get('name', '').title()}</h2>
+                <p>{employee.get('department') or 'Area dipendente'} · {now_rome().strftime('%d/%m/%Y')}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        open_shift_home = current_open_shift(employee_id, public_sb)
+        month_start_home, month_end_home = month_bounds(year, month)
+        home_timesheets = (
+            public_sb.table("timesheets")
+            .select("ordinary_hours,overtime_hours,status,work_date")
+            .eq("employee_id", employee_id)
+            .gte("work_date", month_start_home.isoformat())
+            .lt("work_date", month_end_home.isoformat())
+            .execute().data or []
+        )
+        approved_home = [
+            row for row in home_timesheets
+            if row.get("status") == "approved"
+        ]
+        home_hours = sum(
+            float(row.get("ordinary_hours") or 0)
+            + float(row.get("overtime_hours") or 0)
+            for row in approved_home
+        )
+        home_overtime = sum(
+            float(row.get("overtime_hours") or 0)
+            for row in approved_home
+        )
+
+        if open_shift_home:
+            started_home = parse_db_datetime(open_shift_home.get("clock_in"))
+            shift_status = (
+                f"In servizio dalle {started_home.strftime('%H:%M')}"
+                if started_home else "In servizio"
+            )
+        else:
+            shift_status = "Fuori servizio"
+
+        st.markdown(
+            f"""
+            <div class="rv-quick-grid">
+                <div class="rv-quick-card">
+                    <div class="rv-quick-label">Stato di oggi</div>
+                    <div class="rv-quick-value">{shift_status}</div>
+                </div>
+                <div class="rv-quick-card">
+                    <div class="rv-quick-label">Ore approvate mese</div>
+                    <div class="rv-quick-value">{home_hours:.2f}</div>
+                </div>
+                <div class="rv-quick-card">
+                    <div class="rv-quick-label">Straordinari mese</div>
+                    <div class="rv-quick-value">{home_overtime:.2f}</div>
+                </div>
+                <div class="rv-quick-card">
+                    <div class="rv-quick-label">Periodo</div>
+                    <div class="rv-quick-value">{MONTHS[month]} {year}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.title(f"Benvenuto, {employee.get('name', 'Dipendente').title()}")
         st.caption(employee.get("department") or "Area personale")
 
@@ -2298,7 +2480,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.1 · AI Manager Pro</div>
+            <div class="rv-brand-subtitle">Enterprise 3.2 · Mobile Experience</div>
         </div>
     </div>
     """,

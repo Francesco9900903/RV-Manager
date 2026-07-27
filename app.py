@@ -1669,8 +1669,93 @@ def ensure_automatic_manager_alerts():
 
     return alerts_created
 
+
+def executive_monthly_trend(selected_year, selected_month, months_back=12):
+    points = []
+    cursor_year = selected_year
+    cursor_month = selected_month
+
+    for _ in range(months_back):
+        revenue_rows = (
+            sb.table("monthly_revenue")
+            .select("revenue,covers")
+            .eq("year", cursor_year)
+            .eq("month", cursor_month)
+            .execute().data or []
+        )
+        costs_rows = (
+            sb.table("monthly_costs")
+            .select("company_cost")
+            .eq("year", cursor_year)
+            .eq("month", cursor_month)
+            .execute().data or []
+        )
+        timesheet_rows = (
+            sb.table("timesheets")
+            .select("ordinary_hours,overtime_hours,status,work_date")
+            .eq("status", "approved")
+            .gte(
+                "work_date",
+                date(cursor_year, cursor_month, 1).isoformat(),
+            )
+            .lt(
+                "work_date",
+                month_bounds(cursor_year, cursor_month)[1].isoformat(),
+            )
+            .execute().data or []
+        )
+
+        revenue = float(revenue_rows[0].get("revenue") or 0) if revenue_rows else 0
+        covers = int(revenue_rows[0].get("covers") or 0) if revenue_rows else 0
+        cost = sum(float(row.get("company_cost") or 0) for row in costs_rows)
+        ordinary = sum(float(row.get("ordinary_hours") or 0) for row in timesheet_rows)
+        overtime = sum(float(row.get("overtime_hours") or 0) for row in timesheet_rows)
+
+        points.append({
+            "Periodo": f"{cursor_year:04d}-{cursor_month:02d}",
+            "Costo personale": round(cost, 2),
+            "Fatturato": round(revenue, 2),
+            "Incidenza %": round(cost / revenue * 100, 2) if revenue else 0,
+            "Ore": round(ordinary + overtime, 2),
+            "Straordinari": round(overtime, 2),
+            "Coperti": covers,
+            "Costo/coperto": round(cost / covers, 2) if covers else 0,
+        })
+
+        cursor_month -= 1
+        if cursor_month == 0:
+            cursor_month = 12
+            cursor_year -= 1
+
+    points.reverse()
+    return points
+
+def executive_absence_snapshot(selected_year, selected_month):
+    start_date, end_date = month_bounds(selected_year, selected_month)
+    rows = (
+        sb.table("timesheets")
+        .select("employee_id,work_date,status,ordinary_hours,overtime_hours")
+        .gte("work_date", start_date.isoformat())
+        .lt("work_date", end_date.isoformat())
+        .execute().data or []
+    )
+
+    rejected = sum(1 for row in rows if row.get("status") == "rejected")
+    pending = sum(1 for row in rows if row.get("status") == "submitted")
+    approved_days = len({
+        (row.get("employee_id"), row.get("work_date"))
+        for row in rows
+        if row.get("status") == "approved"
+    })
+
+    return {
+        "rejected": rejected,
+        "pending": pending,
+        "approved_days": approved_days,
+    }
+
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.4 · Alert e scadenze")
+st.sidebar.caption("Enterprise 1.5 · Cruscotto direzionale")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -1684,88 +1769,102 @@ year = st.sidebar.selectbox("Anno", years, index=years.index(today.year))
 month = st.sidebar.selectbox("Mese", list(MONTHS), format_func=lambda x: MONTHS[x], index=today.month - 1)
 
 if section == "Cruscotto":
-    st.title("RV Manager Enterprise")
-    st.caption(f"Centro operativo · {MONTHS[month]} {year}")
+    st.title("Cruscotto direzionale")
+    st.caption(f"RV Manager Enterprise · {MONTHS[month]} {year}")
 
     snapshot = manager_daily_snapshot(year, month)
+    absence_snapshot = executive_absence_snapshot(year, month)
+    trend_rows = executive_monthly_trend(year, month, 12)
 
-    @st.fragment(run_every="30s")
-    def live_manager_metrics():
-        live_snapshot = manager_daily_snapshot(year, month)
+    df, revenue, covers = month_data(year, month)
+    monthly_cost = float(df["management_cost"].sum()) if not df.empty else 0
+    monthly_hours = float(df["hours"].sum()) if not df.empty else 0
+    monthly_overtime = float(snapshot["overtime_total"])
+    cost_per_cover = monthly_cost / covers if covers else 0
+    average_hour_cost = monthly_cost / monthly_hours if monthly_hours else 0
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric(
-            "Presenti ora",
-            f"{live_snapshot['present_now']} / {live_snapshot['active_employees']}",
-        )
-        c2.metric("Ore oggi", f"{live_snapshot['today_hours']:.2f}")
-        c3.metric("Costo oggi", euro(live_snapshot["today_cost"]))
-        c4.metric("Incidenza mese", f"{live_snapshot['incidence']:.1f}%")
-        c5.metric("Da approvare", live_snapshot["pending_count"])
-        c6.metric("Buste pubblicate", live_snapshot["payslip_count"])
+    # Riepilogo direzionale
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Costo personale oggi", euro(snapshot["today_cost"]))
+    r2.metric("Costo personale mese", euro(monthly_cost))
+    r3.metric("Ore lavorate oggi", f"{snapshot['today_hours']:.2f}")
+    r4.metric("Ore mese", f"{monthly_hours:.2f}")
 
-        st.caption(
-            f"Aggiornato alle {now_rome().strftime('%H:%M:%S')} · Europe/Rome"
-        )
+    r5, r6, r7, r8 = st.columns(4)
+    r5.metric("Straordinari mese", f"{monthly_overtime:.2f}")
+    r6.metric("Incidenza personale", f"{snapshot['incidence']:.1f}%")
+    r7.metric("Costo/coperto", euro(cost_per_cover) if covers else "N/D")
+    r8.metric("Costo medio/ora", euro(average_hour_cost) if monthly_hours else "N/D")
 
-    live_manager_metrics()
+    r9, r10, r11, r12 = st.columns(4)
+    r9.metric(
+        "Presenti adesso",
+        f"{snapshot['present_now']} / {snapshot['active_employees']}",
+    )
+    r10.metric("Ore da approvare", snapshot["pending_count"])
+    r11.metric("Registrazioni rifiutate", absence_snapshot["rejected"])
+    r12.metric("Documenti in scadenza", len(document_expiry_snapshot(30)))
 
     ensure_automatic_manager_alerts()
-
-    expiry_items = document_expiry_snapshot(30)
-    if expiry_items:
-        st.subheader("Scadenze documenti")
-        st.dataframe(
-            pd.DataFrame(expiry_items),
-            use_container_width=True,
-            hide_index=True,
-        )
 
     st.subheader("Centro operativo")
     for task in snapshot["agenda"]:
         st.write(f"• {task}")
 
-    if snapshot["present_now"] > 0:
-        st.subheader("Personale attualmente in servizio")
-        current_rows = (
-            sb.table("clock_entries")
-            .select("employee_id,clock_in,shift_type,employees(name,department)")
-            .eq("work_date", date.today().isoformat())
-            .is_("clock_out", "null")
-            .order("clock_in")
-            .execute().data or []
-        )
-        current_view = []
-        for row in current_rows:
-            employee_data = row.get("employees") or {}
-            started = parse_db_datetime(row["clock_in"])
-            current_view.append({
-                "Dipendente": employee_data.get("name", ""),
-                "Reparto": employee_data.get("department", ""),
-                "Entrata": started.strftime("%H:%M"),
-                "Turno": row.get("shift_type", ""),
-            })
-        if current_view:
-            st.dataframe(
-                pd.DataFrame(current_view),
-                use_container_width=True,
-                hide_index=True,
-            )
+    expiry_items = document_expiry_snapshot(30)
+    manager_alerts = [
+        row for row in manager_notification_snapshot(20)
+        if not row["Letta"]
+    ]
 
-    if snapshot["anomalies"]:
-        st.subheader("Avvisi e anomalie")
+    if snapshot["anomalies"] or expiry_items or manager_alerts:
+        st.subheader("Avvisi prioritari")
+
+        combined_alerts = []
+        for row in snapshot["anomalies"]:
+            combined_alerts.append({
+                "Priorità": row.get("Priorità", "Media"),
+                "Area": "Presenze",
+                "Dettaglio": (
+                    f"{row.get('Dipendente', '')} · "
+                    f"{row.get('Anomalia', '')}"
+                ),
+            })
+        for row in expiry_items[:10]:
+            combined_alerts.append({
+                "Priorità": row.get("Priorità", "Media"),
+                "Area": "Documenti",
+                "Dettaglio": (
+                    f"{row.get('Dipendente', '')} · "
+                    f"{row.get('Documento', '')} · "
+                    f"{row.get('Scadenza', '')}"
+                ),
+            })
+        for row in manager_alerts[:10]:
+            combined_alerts.append({
+                "Priorità": row.get("Priorità", "Media"),
+                "Area": "Notifiche",
+                "Dettaglio": row.get("Messaggio", ""),
+            })
+
         st.dataframe(
-            pd.DataFrame(snapshot["anomalies"]),
+            pd.DataFrame(combined_alerts),
             use_container_width=True,
             hide_index=True,
         )
     else:
-        st.success("Nessuna anomalia rilevata.")
+        st.success("Nessuna anomalia o scadenza urgente.")
 
-    tab1, tab2, tab3 = st.tabs(["Panoramica", "Calendario presenze", "Analisi"])
+    tab_summary, tab_trend, tab_people, tab_calendar = st.tabs(
+        [
+            "Sintesi economica",
+            "Andamento 12 mesi",
+            "Personale e reparti",
+            "Calendario presenze",
+        ]
+    )
 
-    with tab1:
-        df, revenue, covers = month_data(year, month)
+    with tab_summary:
         if df.empty:
             st.info("Non risultano ancora costi importati per questo mese.")
         else:
@@ -1773,20 +1872,18 @@ if section == "Cruscotto":
             extra = df["extra_cash"].sum()
             fringe = df["fringe"].sum()
             total = df["management_cost"].sum()
-            hours = df["hours"].sum()
             incidence = total / revenue * 100 if revenue else 0
 
-            a, b, c, d = st.columns(4)
-            a.metric("Costo aziendale", euro(official))
-            b.metric("Extra registrati", euro(extra))
-            c.metric("Fringe benefit", euro(fringe))
-            d.metric("Costo gestionale", euro(total))
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Costo aziendale", euro(official))
+            s2.metric("Extra registrati", euro(extra))
+            s3.metric("Fringe benefit", euro(fringe))
+            s4.metric("Costo gestionale", euro(total))
 
-            e, f, g, h = st.columns(4)
-            e.metric("Fatturato", euro(revenue))
-            f.metric("Incidenza personale", f"{incidence:.1f}%")
-            g.metric("Costo medio/ora", euro(total / hours) if hours else "Ore mancanti")
-            h.metric("Costo/coperto", euro(total / covers) if covers else "Coperti mancanti")
+            s5, s6, s7 = st.columns(3)
+            s5.metric("Fatturato", euro(revenue))
+            s6.metric("Coperti", covers)
+            s7.metric("Incidenza", f"{incidence:.1f}%")
 
             st.subheader("Costo per reparto")
             st.bar_chart(df.groupby("department")["management_cost"].sum())
@@ -1804,30 +1901,125 @@ if section == "Cruscotto":
                 "Fringe", "Extra", "Costo gestionale"
             ]:
                 view[column] = view[column].map(euro)
-            st.dataframe(view, use_container_width=True, hide_index=True)
 
-        st.subheader("Accesso rapido")
-        q1, q2, q3, q4 = st.columns(4)
-        q1.info("👥 Dipendenti")
-        q2.info("⏰ Ore e approvazioni")
-        q3.info("📄 Buste paga")
-        q4.info("💰 Costi e analisi")
+            st.dataframe(
+                view,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    with tab2:
+    with tab_trend:
+        trend_df = pd.DataFrame(trend_rows)
+
+        if trend_df.empty:
+            st.info("Non sono disponibili dati storici.")
+        else:
+            st.subheader("Costo personale e fatturato")
+            st.line_chart(
+                trend_df.set_index("Periodo")[
+                    ["Costo personale", "Fatturato"]
+                ]
+            )
+
+            st.subheader("Incidenza del personale")
+            st.line_chart(
+                trend_df.set_index("Periodo")[["Incidenza %"]]
+            )
+
+            t1, t2 = st.columns(2)
+            with t1:
+                st.subheader("Ore e straordinari")
+                st.bar_chart(
+                    trend_df.set_index("Periodo")[["Ore", "Straordinari"]]
+                )
+            with t2:
+                st.subheader("Costo per coperto")
+                st.line_chart(
+                    trend_df.set_index("Periodo")[["Costo/coperto"]]
+                )
+
+            st.dataframe(
+                trend_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_people:
+        if snapshot["present_now"] > 0:
+            st.subheader("Personale attualmente in servizio")
+            current_rows = (
+                sb.table("clock_entries")
+                .select(
+                    "employee_id,clock_in,shift_type,"
+                    "employees(name,department)"
+                )
+                .eq("work_date", date.today().isoformat())
+                .is_("clock_out", "null")
+                .order("clock_in")
+                .execute().data or []
+            )
+
+            current_view = []
+            for row in current_rows:
+                employee_data = row.get("employees") or {}
+                started = parse_db_datetime(row["clock_in"])
+                elapsed_hours = (
+                    (now_rome() - started).total_seconds() / 3600
+                    if started else 0
+                )
+                current_view.append({
+                    "Dipendente": employee_data.get("name", ""),
+                    "Reparto": employee_data.get("department", ""),
+                    "Entrata": started.strftime("%H:%M") if started else "",
+                    "Ore aperte": round(max(elapsed_hours, 0), 2),
+                    "Turno": row.get("shift_type", ""),
+                })
+
+            st.dataframe(
+                pd.DataFrame(current_view),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Nessun dipendente attualmente in servizio.")
+
+        if snapshot["dept_hours"]:
+            st.subheader("Ore approvate per reparto")
+            st.bar_chart(
+                pd.Series(snapshot["dept_hours"]).sort_values(
+                    ascending=False
+                )
+            )
+        else:
+            st.info("Non risultano ancora ore approvate per reparto.")
+
+        p1, p2, p3 = st.columns(3)
+        p1.metric(
+            "Giornate approvate",
+            absence_snapshot["approved_days"],
+        )
+        p2.metric(
+            "In attesa di approvazione",
+            absence_snapshot["pending"],
+        )
+        p3.metric(
+            "Registrazioni rifiutate",
+            absence_snapshot["rejected"],
+        )
+
+    with tab_calendar:
         st.dataframe(
             pd.DataFrame(snapshot["calendar_rows"]),
             use_container_width=True,
             hide_index=True,
         )
 
-    with tab3:
-        if snapshot["dept_hours"]:
-            st.subheader("Ore approvate per reparto")
-            st.bar_chart(pd.Series(snapshot["dept_hours"]).sort_values(ascending=False))
-        else:
-            st.info("Non ci sono ancora ore approvate nel mese selezionato.")
-        st.metric("Straordinari del mese", f"{snapshot['overtime_total']:.2f} ore")
-        st.metric("Coperti del mese", snapshot["covers"])
+    st.subheader("Accesso rapido")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.info("👥 Dipendenti")
+    q2.info("⏰ Ore e approvazioni")
+    q3.info("📄 Documenti e buste paga")
+    q4.info("🔔 Notifiche e scadenze")
 
 elif section == "Importa costi":
     st.title("Importa prospetto costi paghe")

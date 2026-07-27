@@ -2565,13 +2565,126 @@ def personnel_bi_insights(current_period, previous_period_data):
 
     return insights
 
+
+def security_health_snapshot():
+    checks = []
+
+    # Secrets principali.
+    try:
+        supabase_cfg = st.secrets.get("supabase", {})
+    except Exception:
+        supabase_cfg = {}
+
+    has_url = bool(supabase_cfg.get("url"))
+    has_secret = bool(
+        supabase_cfg.get("secret_key")
+        or supabase_cfg.get("service_role_key")
+    )
+    has_public = bool(
+        supabase_cfg.get("publishable_key")
+        or supabase_cfg.get("anon_key")
+    )
+
+    checks.append({
+        "Controllo": "URL Supabase configurato",
+        "Esito": "OK" if has_url else "MANCANTE",
+        "Priorità": "Alta",
+    })
+    checks.append({
+        "Controllo": "Chiave server configurata nei Secrets",
+        "Esito": "OK" if has_secret else "MANCANTE",
+        "Priorità": "Alta",
+    })
+    checks.append({
+        "Controllo": "Chiave pubblica configurata",
+        "Esito": "OK" if has_public else "MANCANTE",
+        "Priorità": "Media",
+    })
+
+    # Tabelle principali.
+    table_names = [
+        "employees",
+        "employee_accounts",
+        "timesheets",
+        "clock_entries",
+        "payslips",
+        "employee_documents",
+        "audit_events",
+    ]
+    for table_name in table_names:
+        try:
+            sb.table(table_name).select("*").limit(1).execute()
+            result = "OK"
+        except Exception:
+            result = "ERRORE"
+        checks.append({
+            "Controllo": f"Tabella {table_name}",
+            "Esito": result,
+            "Priorità": "Alta" if table_name in {
+                "employees", "employee_accounts", "employee_documents", "payslips"
+            } else "Media",
+        })
+
+    # Bucket privati.
+    for bucket_name in ["payslips", "employee-documents"]:
+        try:
+            sb.storage.from_(bucket_name).list()
+            result = "OK"
+        except Exception:
+            result = "ERRORE"
+        checks.append({
+            "Controllo": f"Bucket privato {bucket_name}",
+            "Esito": result,
+            "Priorità": "Alta",
+        })
+
+    return checks
+
+def export_backup_manifest():
+    manifest = {
+        "generated_at": now_rome().isoformat(),
+        "application": "RV Manager Enterprise",
+        "version": "3.4.0",
+        "tables": {},
+    }
+
+    for table_name in [
+        "employees",
+        "employee_accounts",
+        "timesheets",
+        "clock_entries",
+        "monthly_costs",
+        "monthly_revenue",
+        "fringe_benefits",
+        "extra_payments",
+        "payslips",
+        "employee_documents",
+        "employee_notifications",
+        "manager_notifications",
+        "audit_events",
+    ]:
+        try:
+            rows = (
+                sb.table(table_name)
+                .select("*")
+                .limit(10000)
+                .execute().data or []
+            )
+            manifest["tables"][table_name] = rows
+        except Exception as exc:
+            manifest["tables"][table_name] = {
+                "_error": f"{type(exc).__name__}: {exc}"
+            }
+
+    return manifest
+
 st.sidebar.markdown(
     """
     <div class="rv-brand">
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.3 · Dashboard Pro</div>
+            <div class="rv-brand-subtitle">Enterprise 3.4 · Sicurezza e collaudo</div>
         </div>
     </div>
     """,
@@ -2591,6 +2704,7 @@ MENU_ICONS = {
     "Buste paga": "▤",
     "Centro documenti": "□",
     "Centro notifiche": "●",
+    "Sicurezza e collaudo": "⚿",
     "Fringe benefit": "◆",
     "Extra da regolarizzare": "△",
     "Dati del mese": "▦",
@@ -2609,6 +2723,7 @@ MENU_ITEMS = [
     "Buste paga",
     "Centro documenti",
     "Centro notifiche",
+    "Sicurezza e collaudo",
     "Fringe benefit",
     "Extra da regolarizzare",
     "Dati del mese",
@@ -4384,6 +4499,190 @@ elif section == "Centro notifiche":
         )
     else:
         st.info("Nessun documento in scadenza nei prossimi 60 giorni.")
+
+
+
+elif section == "Sicurezza e collaudo":
+    st.title("Sicurezza, backup e collaudo")
+    st.caption(
+        "Controlli tecnici prima dell'utilizzo con dati reali e sensibili."
+    )
+
+    tab_health, tab_backup, tab_tests, tab_access = st.tabs(
+        [
+            "Stato sicurezza",
+            "Backup dati",
+            "Checklist collaudo",
+            "Verifica accessi",
+        ]
+    )
+
+    with tab_health:
+        checks = security_health_snapshot()
+        check_df = pd.DataFrame(checks)
+
+        ok_count = int((check_df["Esito"] == "OK").sum())
+        total_count = len(check_df)
+        critical_errors = int(
+            (
+                (check_df["Esito"] != "OK")
+                & (check_df["Priorità"] == "Alta")
+            ).sum()
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Controlli superati", f"{ok_count}/{total_count}")
+        c2.metric("Errori prioritari", critical_errors)
+        c3.metric(
+            "Stato generale",
+            "Pronto" if critical_errors == 0 else "Da correggere",
+        )
+
+        st.dataframe(
+            check_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if critical_errors:
+            st.error(
+                "Sono presenti controlli prioritari non superati. "
+                "Non caricare nuovi dati sensibili prima della correzione."
+            )
+        else:
+            st.success(
+                "I controlli tecnici principali risultano superati."
+            )
+
+        st.warning(
+            "Le chiavi Supabase apparse in screenshot o conversazioni devono "
+            "essere rigenerate prima dell'utilizzo definitivo."
+        )
+
+    with tab_backup:
+        st.subheader("Esportazione tecnica dei dati")
+        st.caption(
+            "Il file JSON contiene le righe delle principali tabelle. "
+            "I file PDF presenti nello Storage non sono inclusi."
+        )
+
+        if st.button("Prepara backup JSON", type="primary"):
+            with st.spinner("Preparazione backup..."):
+                manifest = export_backup_manifest()
+                backup_bytes = json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ).encode("utf-8")
+
+            st.download_button(
+                "Scarica backup JSON",
+                data=backup_bytes,
+                file_name=(
+                    f"rv_manager_backup_"
+                    f"{now_rome().strftime('%Y%m%d_%H%M%S')}.json"
+                ),
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            audit(
+                "backup_exported",
+                "Backup JSON preparato",
+                entity_type="system_backup",
+                details={
+                    "generated_at": manifest["generated_at"],
+                    "tables": list(manifest["tables"]),
+                },
+            )
+
+        st.info(
+            "Per un backup completo dello Storage, scarica separatamente i "
+            "bucket privati da Supabase oppure usa uno script amministrativo."
+        )
+
+    with tab_tests:
+        st.subheader("Checklist collaudo")
+        checklist = [
+            "Accesso manager",
+            "Accesso dipendente",
+            "Dipendente vede solo il proprio profilo",
+            "Timbratura entrata",
+            "Timbratura uscita",
+            "Inserimento manuale ore",
+            "Approvazione ore",
+            "Rifiuto ore",
+            "Caricamento documento dipendente",
+            "Documento visibile solo al dipendente corretto",
+            "Pubblicazione busta paga",
+            "Busta paga visibile solo al dipendente corretto",
+            "Registro eventi aggiornato",
+            "Dashboard desktop",
+            "Dashboard smartphone",
+            "Sidebar mobile",
+            "Backup JSON scaricabile",
+        ]
+
+        results = []
+        for item in checklist:
+            passed = st.checkbox(item, key=f"qa_{item}")
+            results.append({"Test": item, "Superato": passed})
+
+        passed_count = sum(1 for row in results if row["Superato"])
+        st.progress(passed_count / len(results))
+        st.caption(
+            f"Test completati: {passed_count} su {len(results)}"
+        )
+
+        if passed_count == len(results):
+            st.success("Collaudo completo.")
+            if st.button("Registra collaudo completato"):
+                audit(
+                    "qa_completed",
+                    "Checklist di collaudo completata",
+                    entity_type="quality_assurance",
+                    details={"tests": len(results)},
+                    severity="success",
+                )
+                st.success("Collaudo registrato nel Registro eventi.")
+
+    with tab_access:
+        st.subheader("Controllo associazioni account")
+        accounts = (
+            sb.table("employee_accounts")
+            .select(
+                "auth_user_id,employee_id,role,"
+                "employees(name,department,active)"
+            )
+            .execute().data or []
+        )
+
+        rows = []
+        for account in accounts:
+            employee = account.get("employees") or {}
+            rows.append({
+                "Utente Auth": account.get("auth_user_id", ""),
+                "Dipendente": employee.get("name", ""),
+                "Reparto": employee.get("department", ""),
+                "Ruolo": account.get("role", ""),
+                "Dipendente attivo": bool(employee.get("active")),
+            })
+
+        if rows:
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Nessun account dipendente associato.")
+
+        st.warning(
+            "La verifica definitiva va eseguita effettuando login con almeno "
+            "due account dipendente differenti e controllando documenti, "
+            "buste paga e ore."
+        )
 
 
 elif section == "Fringe benefit":

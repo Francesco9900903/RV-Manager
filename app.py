@@ -1518,7 +1518,7 @@ def manager_daily_snapshot(selected_year, selected_month):
     }
 
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.3.1 · Fix documenti privati")
+st.sidebar.caption("Enterprise 1.3.2 · Fix upload documenti")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
@@ -2127,12 +2127,13 @@ elif section == "Centro documenti":
                     f"{now_rome().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
                 )
 
-                binary_file = BytesIO(uploaded_document.getvalue())
-                binary_file.name = safe_name
+                # Il client Storage installato su Streamlit accetta i bytes
+                # del file; BytesIO genera TypeError in questa versione.
+                file_bytes = uploaded_document.getvalue()
 
                 sb.storage.from_("employee-documents").upload(
                     path=storage_path,
-                    file=binary_file,
+                    file=file_bytes,
                     file_options={
                         "content-type": uploaded_document.type
                         or "application/octet-stream",

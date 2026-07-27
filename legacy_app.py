@@ -152,6 +152,88 @@ st.markdown(
         margin-top: 0.16rem;
     }
 
+
+    .rv-kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.85rem;
+        margin: 0.8rem 0 1.2rem 0;
+    }
+
+    .rv-kpi-card {
+        background: #fff;
+        border: 1px solid var(--rv-border);
+        border-radius: 16px;
+        padding: 1rem;
+        box-shadow: var(--rv-shadow);
+    }
+
+    .rv-kpi-card.good {
+        border-left: 5px solid #0f9f6e;
+    }
+
+    .rv-kpi-card.warn {
+        border-left: 5px solid #d97706;
+    }
+
+    .rv-kpi-card.danger {
+        border-left: 5px solid #c83b4d;
+    }
+
+    .rv-kpi-card.info {
+        border-left: 5px solid #3b82f6;
+    }
+
+    .rv-kpi-label {
+        color: var(--rv-muted);
+        font-size: 0.78rem;
+        font-weight: 700;
+    }
+
+    .rv-kpi-value {
+        color: var(--rv-navy);
+        font-size: 1.65rem;
+        font-weight: 800;
+        margin-top: 0.25rem;
+    }
+
+    .rv-kpi-note {
+        color: var(--rv-muted);
+        font-size: 0.74rem;
+        margin-top: 0.25rem;
+    }
+
+    .rv-section-card {
+        background: #fff;
+        border: 1px solid var(--rv-border);
+        border-radius: 16px;
+        padding: 1rem;
+        box-shadow: var(--rv-shadow);
+        margin-bottom: 1rem;
+    }
+
+    @media (max-width: 1000px) {
+        .rv-kpi-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+    }
+
+    @media (max-width: 600px) {
+        .rv-kpi-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.55rem;
+        }
+
+        .rv-kpi-card {
+            padding: 0.75rem;
+        }
+
+        .rv-kpi-value {
+            font-size: 1.3rem;
+        }
+    }
+
+
     /* Metriche come card */
     div[data-testid="stMetric"] {
         background: var(--rv-surface);
@@ -317,11 +399,12 @@ st.markdown(
             max-width: 230px !important;
             width: 230px !important;
         }
-        section[data-testid="stSidebar"] > d
-        width: 230px ! important;
+
+        section[data-testid="stSidebar"] > div {
+            width: 230px !important;
         }
-        
-  .block-container {
+
+        .block-container {
             padding-top: 0.8rem;
             padding-bottom: 5rem;
         }
@@ -2103,7 +2186,11 @@ def manager_notification_snapshot(limit=30):
         employee_data = row.get("employees") or {}
         result.append({
             "ID": int(row["id"]),
-            "Priorità": row.get("priority", "Media"),
+            "Priorità": (
+                "🔴 Alta" if row.get("priority") == "Alta"
+                else "🟠 Media" if row.get("priority") == "Media"
+                else "🟢 Bassa"
+            ),
             "Titolo": row.get("title", ""),
             "Messaggio": row.get("message", ""),
             "Dipendente": employee_data.get("name", ""),
@@ -2484,7 +2571,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.2 · Mobile Experience</div>
+            <div class="rv-brand-subtitle">Enterprise 3.3 · Dashboard Pro</div>
         </div>
     </div>
     """,
@@ -2557,6 +2644,43 @@ if section == "Cruscotto":
     cost_per_cover = monthly_cost / covers if covers else 0
     average_hour_cost = monthly_cost / monthly_hours if monthly_hours else 0
 
+    present_class = "good" if snapshot["present_now"] > 0 else "warn"
+    pending_class = "warn" if snapshot["pending_count"] > 0 else "good"
+    expiry_class = "danger" if len(document_expiry_snapshot(30)) > 0 else "good"
+    incidence_class = (
+        "danger" if snapshot["incidence"] >= 35
+        else "warn" if snapshot["incidence"] >= 32
+        else "good"
+    )
+
+    st.markdown(
+        f"""
+        <div class="rv-kpi-grid">
+            <div class="rv-kpi-card {present_class}">
+                <div class="rv-kpi-label">Presenti adesso</div>
+                <div class="rv-kpi-value">{snapshot['present_now']} / {snapshot['active_employees']}</div>
+                <div class="rv-kpi-note">Personale attualmente in servizio</div>
+            </div>
+            <div class="rv-kpi-card info">
+                <div class="rv-kpi-label">Ore lavorate oggi</div>
+                <div class="rv-kpi-value">{snapshot['today_hours']:.2f}</div>
+                <div class="rv-kpi-note">Incluse le timbrature aperte</div>
+            </div>
+            <div class="rv-kpi-card {pending_class}">
+                <div class="rv-kpi-label">Ore da approvare</div>
+                <div class="rv-kpi-value">{snapshot['pending_count']}</div>
+                <div class="rv-kpi-note">Registrazioni in attesa</div>
+            </div>
+            <div class="rv-kpi-card {expiry_class}">
+                <div class="rv-kpi-label">Documenti in scadenza</div>
+                <div class="rv-kpi-value">{len(document_expiry_snapshot(30))}</div>
+                <div class="rv-kpi-note">Entro i prossimi 30 giorni</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # Riepilogo direzionale
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("Costo personale oggi", euro(snapshot["today_cost"]))
@@ -2581,7 +2705,15 @@ if section == "Cruscotto":
 
     ensure_automatic_manager_alerts()
 
-    st.subheader("Centro operativo")
+    st.markdown(
+        """
+        <div class="rv-section-card">
+            <h3 style="margin-top:0">Centro operativo</h3>
+            <p style="margin-bottom:0">Priorità, controlli e attività del periodo selezionato.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     for task in snapshot["agenda"]:
         st.write(f"• {task}")
 

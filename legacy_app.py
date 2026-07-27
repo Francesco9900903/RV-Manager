@@ -7,9 +7,9 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from supabase import create_client
-from rv_manager.ai_manager import build_personnel_insights
-from rv_manager.event_log import log_event, recent_events
-from rv_manager.ui import render_insight
+from ai_manager import build_personnel_insights
+from event_log import log_event, recent_events
+from ui import render_insight
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="RV Manager", page_icon="👥", layout="wide")

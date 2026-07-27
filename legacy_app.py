@@ -1272,8 +1272,8 @@ def employee_portal():
 
         open_shift_home = current_open_shift(employee_id, public_sb)
         today = datetime.now(ROME_TZ)
-year = today.year
-month = today.month
+        year = today.year
+        month = today.month
         month_start_home, month_end_home = month_bounds(year, month)
         home_timesheets = (
             public_sb.table("timesheets")

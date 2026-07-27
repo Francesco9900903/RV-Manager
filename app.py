@@ -1517,13 +1517,165 @@ def manager_daily_snapshot(selected_year, selected_month):
         "dept_hours": dept_hours,
     }
 
+
+def document_expiry_snapshot(days_ahead=60):
+    today = date.today()
+    limit_date = today + timedelta(days=days_ahead)
+
+    rows = (
+        sb.table("employee_documents")
+        .select(
+            "id,employee_id,title,document_type,expiry_date,status,"
+            "employees(name,department)"
+        )
+        .eq("status", "published")
+        .not_.is_("expiry_date", "null")
+        .lte("expiry_date", limit_date.isoformat())
+        .order("expiry_date")
+        .execute().data or []
+    )
+
+    result = []
+    for row in rows:
+        expiry = date.fromisoformat(row["expiry_date"])
+        days_left = (expiry - today).days
+        employee_data = row.get("employees") or {}
+
+        if days_left < 0:
+            status = "Scaduto"
+            priority = "Alta"
+        elif days_left <= 15:
+            status = "In scadenza"
+            priority = "Alta"
+        elif days_left <= 30:
+            status = "Da controllare"
+            priority = "Media"
+        else:
+            status = "Prossima scadenza"
+            priority = "Bassa"
+
+        result.append({
+            "ID": int(row["id"]),
+            "Dipendente": employee_data.get("name", ""),
+            "Reparto": employee_data.get("department", ""),
+            "Documento": row.get("title", ""),
+            "Categoria": row.get("document_type", ""),
+            "Scadenza": row.get("expiry_date", ""),
+            "Giorni residui": days_left,
+            "Stato": status,
+            "Priorità": priority,
+        })
+
+    return result
+
+def manager_notification_snapshot(limit=30):
+    rows = (
+        sb.table("manager_notifications")
+        .select(
+            "id,title,message,notification_type,priority,is_read,"
+            "created_at,employee_id,employees(name)"
+        )
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute().data or []
+    )
+
+    result = []
+    for row in rows:
+        employee_data = row.get("employees") or {}
+        result.append({
+            "ID": int(row["id"]),
+            "Priorità": row.get("priority", "Media"),
+            "Titolo": row.get("title", ""),
+            "Messaggio": row.get("message", ""),
+            "Dipendente": employee_data.get("name", ""),
+            "Letta": bool(row.get("is_read")),
+            "Creata": row.get("created_at", ""),
+        })
+    return result
+
+def ensure_automatic_manager_alerts():
+    """
+    Crea alert solo quando non esiste già un alert aperto equivalente.
+    """
+    today = date.today()
+    alerts_created = 0
+
+    # Documenti scaduti o in scadenza.
+    for item in document_expiry_snapshot(30):
+        alert_key = f"document:{item['ID']}:{item['Scadenza']}"
+        existing = (
+            sb.table("manager_notifications")
+            .select("id")
+            .eq("alert_key", alert_key)
+            .eq("is_read", False)
+            .limit(1)
+            .execute().data or []
+        )
+        if not existing:
+            sb.table("manager_notifications").insert({
+                "employee_id": None,
+                "title": f"Documento {item['Stato'].lower()}",
+                "message": (
+                    f"{item['Documento']} · {item['Dipendente']} · "
+                    f"scadenza {item['Scadenza']}."
+                ),
+                "notification_type": "document_expiry",
+                "priority": item["Priorità"],
+                "alert_key": alert_key,
+                "is_read": False,
+            }).execute()
+            alerts_created += 1
+
+    # Timbrature aperte da oltre 10 ore.
+    open_rows = (
+        sb.table("clock_entries")
+        .select("id,employee_id,clock_in,employees(name)")
+        .is_("clock_out", "null")
+        .execute().data or []
+    )
+    for row in open_rows:
+        started = parse_db_datetime(row.get("clock_in"))
+        if not started:
+            continue
+        hours_open = (now_rome() - started).total_seconds() / 3600
+        if hours_open < 10:
+            continue
+
+        alert_key = f"clock:{row['id']}:over10h"
+        existing = (
+            sb.table("manager_notifications")
+            .select("id")
+            .eq("alert_key", alert_key)
+            .eq("is_read", False)
+            .limit(1)
+            .execute().data or []
+        )
+        if not existing:
+            employee_data = row.get("employees") or {}
+            sb.table("manager_notifications").insert({
+                "employee_id": row.get("employee_id"),
+                "title": "Turno aperto da oltre 10 ore",
+                "message": (
+                    f"{employee_data.get('name', 'Dipendente')} risulta "
+                    f"in servizio da {hours_open:.1f} ore."
+                ),
+                "notification_type": "clock_anomaly",
+                "priority": "Alta",
+                "alert_key": alert_key,
+                "is_read": False,
+            }).execute()
+            alerts_created += 1
+
+    return alerts_created
+
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.3.2 · Fix upload documenti")
+st.sidebar.caption("Enterprise 1.4 · Alert e scadenze")
 section = st.sidebar.radio(
     "Personale",
     ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
      "Ore e approvazioni", "Accessi dipendenti", "Buste paga", "Centro documenti",
-     "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
+     "Centro notifiche", "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
 )
 
 today = date.today()
@@ -1557,6 +1709,17 @@ if section == "Cruscotto":
         )
 
     live_manager_metrics()
+
+    ensure_automatic_manager_alerts()
+
+    expiry_items = document_expiry_snapshot(30)
+    if expiry_items:
+        st.subheader("Scadenze documenti")
+        st.dataframe(
+            pd.DataFrame(expiry_items),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.subheader("Centro operativo")
     for task in snapshot["agenda"]:
@@ -2166,6 +2329,22 @@ elif section == "Centro documenti":
                     "is_read": False,
                 }).execute()
 
+                sb.table("manager_notifications").insert({
+                    "employee_id": employee_id,
+                    "title": "Documento pubblicato",
+                    "message": (
+                        f"{title.strip()} è stato pubblicato nell'area privata "
+                        f"di {employee_by_id[employee_id]['name']}."
+                    ),
+                    "notification_type": "document_published",
+                    "priority": "Bassa",
+                    "alert_key": (
+                        f"document-published:{employee_id}:"
+                        f"{storage_path}"
+                    ),
+                    "is_read": False,
+                }).execute()
+
                 st.success(
                     "Documento pubblicato nell'area privata del dipendente."
                 )
@@ -2251,6 +2430,81 @@ elif section == "Centro documenti":
             }).eq("id", selected_archive_id).execute()
             st.success("Documento archiviato.")
             st.rerun()
+
+
+
+elif section == "Centro notifiche":
+    st.title("Centro notifiche")
+    st.caption(
+        "Avvisi operativi, anomalie e scadenze da controllare."
+    )
+
+    if st.button("Aggiorna controlli automatici", type="primary"):
+        created = ensure_automatic_manager_alerts()
+        st.success(f"Controllo completato. Nuovi avvisi creati: {created}.")
+        st.rerun()
+
+    notifications = manager_notification_snapshot()
+
+    if not notifications:
+        st.success("Non ci sono notifiche.")
+    else:
+        unread = [row for row in notifications if not row["Letta"]]
+        a, b, c = st.columns(3)
+        a.metric("Totali", len(notifications))
+        b.metric("Da leggere", len(unread))
+        c.metric(
+            "Priorità alta",
+            sum(1 for row in unread if row["Priorità"] == "Alta"),
+        )
+
+        st.dataframe(
+            pd.DataFrame(notifications),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selected_id = st.selectbox(
+            "Notifica da gestire",
+            [row["ID"] for row in notifications],
+            format_func=lambda value: next(
+                (
+                    f"{row['Priorità']} · {row['Titolo']}"
+                    for row in notifications
+                    if row["ID"] == value
+                ),
+                str(value),
+            ),
+        )
+
+        n1, n2 = st.columns(2)
+        if n1.button("Segna come letta", use_container_width=True):
+            sb.table("manager_notifications").update({
+                "is_read": True,
+                "read_at": now_rome().isoformat(),
+            }).eq("id", selected_id).execute()
+            st.success("Notifica aggiornata.")
+            st.rerun()
+
+        if n2.button("Segna come da leggere", use_container_width=True):
+            sb.table("manager_notifications").update({
+                "is_read": False,
+                "read_at": None,
+            }).eq("id", selected_id).execute()
+            st.success("Notifica aggiornata.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Scadenze entro 60 giorni")
+    expiry_rows = document_expiry_snapshot(60)
+    if expiry_rows:
+        st.dataframe(
+            pd.DataFrame(expiry_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Nessun documento in scadenza nei prossimi 60 giorni.")
 
 
 elif section == "Fringe benefit":

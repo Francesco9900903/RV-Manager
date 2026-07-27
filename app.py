@@ -1754,13 +1754,220 @@ def executive_absence_snapshot(selected_year, selected_month):
         "approved_days": approved_days,
     }
 
+
+def previous_period(selected_year, selected_month):
+    if selected_month == 1:
+        return selected_year - 1, 12
+    return selected_year, selected_month - 1
+
+def personnel_bi_period(selected_year, selected_month):
+    df, revenue, covers = month_data(selected_year, selected_month)
+
+    if df.empty:
+        return {
+            "df": df,
+            "revenue": revenue,
+            "covers": covers,
+            "official_cost": 0.0,
+            "management_cost": 0.0,
+            "hours": 0.0,
+            "overtime": 0.0,
+            "incidence": 0.0,
+            "cost_per_hour": 0.0,
+            "cost_per_cover": 0.0,
+            "employee_count": 0,
+            "department_costs": {},
+            "department_hours": {},
+        }
+
+    start_date, end_date = month_bounds(selected_year, selected_month)
+    timesheets = (
+        sb.table("timesheets")
+        .select(
+            "employee_id,ordinary_hours,overtime_hours,status,"
+            "employees(name,department)"
+        )
+        .eq("status", "approved")
+        .gte("work_date", start_date.isoformat())
+        .lt("work_date", end_date.isoformat())
+        .execute().data or []
+    )
+
+    department_hours = {}
+    overtime = 0.0
+    for row in timesheets:
+        employee = row.get("employees") or {}
+        department = employee.get("department") or "Da assegnare"
+        ordinary_hours = float(row.get("ordinary_hours") or 0)
+        overtime_hours = float(row.get("overtime_hours") or 0)
+        department_hours[department] = (
+            department_hours.get(department, 0)
+            + ordinary_hours
+            + overtime_hours
+        )
+        overtime += overtime_hours
+
+    official_cost = float(df["company_cost"].sum())
+    management_cost = float(df["management_cost"].sum())
+    hours = float(df["hours"].sum())
+    incidence = management_cost / revenue * 100 if revenue else 0
+    cost_per_hour = management_cost / hours if hours else 0
+    cost_per_cover = management_cost / covers if covers else 0
+
+    department_costs = (
+        df.groupby("department")["management_cost"]
+        .sum()
+        .sort_values(ascending=False)
+        .to_dict()
+    )
+
+    return {
+        "df": df,
+        "revenue": float(revenue or 0),
+        "covers": int(covers or 0),
+        "official_cost": official_cost,
+        "management_cost": management_cost,
+        "hours": hours,
+        "overtime": overtime,
+        "incidence": incidence,
+        "cost_per_hour": cost_per_hour,
+        "cost_per_cover": cost_per_cover,
+        "employee_count": int(df["employee_id"].nunique()),
+        "department_costs": department_costs,
+        "department_hours": department_hours,
+    }
+
+def variation_percent(current_value, previous_value):
+    if previous_value == 0:
+        return None
+    return (current_value - previous_value) / previous_value * 100
+
+def format_variation(value):
+    if value is None:
+        return "N/D"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.1f}%"
+
+def personnel_bi_history(selected_year, selected_month, months_back=12):
+    rows = []
+    cursor_year = selected_year
+    cursor_month = selected_month
+
+    for _ in range(months_back):
+        period = personnel_bi_period(cursor_year, cursor_month)
+        rows.append({
+            "Periodo": f"{cursor_year:04d}-{cursor_month:02d}",
+            "Costo aziendale": round(period["official_cost"], 2),
+            "Costo gestionale": round(period["management_cost"], 2),
+            "Fatturato": round(period["revenue"], 2),
+            "Incidenza %": round(period["incidence"], 2),
+            "Ore": round(period["hours"], 2),
+            "Straordinari": round(period["overtime"], 2),
+            "Costo/ora": round(period["cost_per_hour"], 2),
+            "Costo/coperto": round(period["cost_per_cover"], 2),
+            "Dipendenti": period["employee_count"],
+        })
+
+        cursor_year, cursor_month = previous_period(cursor_year, cursor_month)
+
+    rows.reverse()
+    return rows
+
+def personnel_bi_insights(current_period, previous_period_data):
+    insights = []
+
+    cost_change = variation_percent(
+        current_period["management_cost"],
+        previous_period_data["management_cost"],
+    )
+    incidence_change = (
+        current_period["incidence"] - previous_period_data["incidence"]
+        if previous_period_data["incidence"] or current_period["incidence"]
+        else None
+    )
+    overtime_change = variation_percent(
+        current_period["overtime"],
+        previous_period_data["overtime"],
+    )
+    hours_change = variation_percent(
+        current_period["hours"],
+        previous_period_data["hours"],
+    )
+
+    if cost_change is not None:
+        if cost_change > 5:
+            insights.append(
+                f"Il costo gestionale del personale è aumentato del "
+                f"{cost_change:.1f}% rispetto al mese precedente."
+            )
+        elif cost_change < -5:
+            insights.append(
+                f"Il costo gestionale del personale è diminuito del "
+                f"{abs(cost_change):.1f}% rispetto al mese precedente."
+            )
+
+    if incidence_change is not None:
+        if incidence_change > 2:
+            insights.append(
+                f"L'incidenza del personale è peggiorata di "
+                f"{incidence_change:.1f} punti percentuali."
+            )
+        elif incidence_change < -2:
+            insights.append(
+                f"L'incidenza del personale è migliorata di "
+                f"{abs(incidence_change):.1f} punti percentuali."
+            )
+
+    if overtime_change is not None and overtime_change > 20:
+        insights.append(
+            f"Gli straordinari sono aumentati del {overtime_change:.1f}%."
+        )
+
+    if hours_change is not None and current_period["management_cost"] > 0:
+        if hours_change < -10 and (cost_change or 0) > 0:
+            insights.append(
+                "Le ore sono diminuite, ma il costo è aumentato: "
+                "verifica premi, extra, livelli contrattuali o componenti una tantum."
+            )
+
+    if current_period["incidence"] > 35:
+        insights.append(
+            f"Incidenza personale elevata: {current_period['incidence']:.1f}%."
+        )
+    elif 0 < current_period["incidence"] <= 30:
+        insights.append(
+            f"Incidenza personale sotto il 30%: "
+            f"{current_period['incidence']:.1f}%."
+        )
+
+    if current_period["department_costs"]:
+        top_department = max(
+            current_period["department_costs"],
+            key=current_period["department_costs"].get,
+        )
+        top_value = current_period["department_costs"][top_department]
+        total = current_period["management_cost"]
+        share = top_value / total * 100 if total else 0
+        insights.append(
+            f"Il reparto con il costo più alto è {top_department}: "
+            f"{euro(top_value)}, pari al {share:.1f}% del totale."
+        )
+
+    if not insights:
+        insights.append(
+            "Non emergono variazioni rilevanti rispetto al mese precedente."
+        )
+
+    return insights
+
 st.sidebar.title("RV Manager Enterprise")
-st.sidebar.caption("Enterprise 1.5 · Cruscotto direzionale")
+st.sidebar.caption("Enterprise 1.6 · Business Intelligence personale")
 section = st.sidebar.radio(
     "Personale",
-    ["Cruscotto", "Importa costi", "Dipendenti", "Scheda dipendente",
-     "Ore e approvazioni", "Accessi dipendenti", "Buste paga", "Centro documenti",
-     "Centro notifiche", "Fringe benefit", "Extra da regolarizzare", "Dati del mese"]
+    ["Cruscotto", "Business Intelligence", "Importa costi", "Dipendenti",
+     "Scheda dipendente", "Ore e approvazioni", "Accessi dipendenti",
+     "Buste paga", "Centro documenti", "Centro notifiche", "Fringe benefit",
+     "Extra da regolarizzare", "Dati del mese"]
 )
 
 today = date.today()
@@ -2020,6 +2227,311 @@ if section == "Cruscotto":
     q2.info("⏰ Ore e approvazioni")
     q3.info("📄 Documenti e buste paga")
     q4.info("🔔 Notifiche e scadenze")
+
+
+elif section == "Business Intelligence":
+    st.title("Business Intelligence del personale")
+    st.caption(
+        f"Analisi comparativa · {MONTHS[month]} {year}"
+    )
+
+    current = personnel_bi_period(year, month)
+    prev_year, prev_month = previous_period(year, month)
+    previous = personnel_bi_period(prev_year, prev_month)
+
+    if current["df"].empty:
+        st.info(
+            "Non risultano dati del personale per il periodo selezionato."
+        )
+    else:
+        cost_change = variation_percent(
+            current["management_cost"],
+            previous["management_cost"],
+        )
+        hours_change = variation_percent(
+            current["hours"],
+            previous["hours"],
+        )
+        overtime_change = variation_percent(
+            current["overtime"],
+            previous["overtime"],
+        )
+        incidence_delta = (
+            current["incidence"] - previous["incidence"]
+            if previous["incidence"] or current["incidence"]
+            else None
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Costo gestionale",
+            euro(current["management_cost"]),
+            format_variation(cost_change),
+        )
+        k2.metric(
+            "Incidenza personale",
+            f"{current['incidence']:.1f}%",
+            (
+                f"{incidence_delta:+.1f} pt"
+                if incidence_delta is not None else "N/D"
+            ),
+            delta_color="inverse",
+        )
+        k3.metric(
+            "Ore lavorate",
+            f"{current['hours']:.2f}",
+            format_variation(hours_change),
+        )
+        k4.metric(
+            "Straordinari",
+            f"{current['overtime']:.2f}",
+            format_variation(overtime_change),
+            delta_color="inverse",
+        )
+
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Costo medio/ora", euro(current["cost_per_hour"]))
+        k6.metric("Costo/coperto", euro(current["cost_per_cover"]))
+        k7.metric("Dipendenti nel mese", current["employee_count"])
+        k8.metric("Fatturato", euro(current["revenue"]))
+
+        tab1, tab2, tab3, tab4 = st.tabs(
+            [
+                "Confronto mensile",
+                "Reparti",
+                "Dipendenti",
+                "Indicatori e suggerimenti",
+            ]
+        )
+
+        with tab1:
+            history = pd.DataFrame(
+                personnel_bi_history(year, month, 12)
+            )
+
+            st.subheader("Costo e fatturato")
+            st.line_chart(
+                history.set_index("Periodo")[
+                    ["Costo gestionale", "Fatturato"]
+                ]
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Incidenza personale")
+                st.line_chart(
+                    history.set_index("Periodo")[["Incidenza %"]]
+                )
+            with c2:
+                st.subheader("Costo medio per ora")
+                st.line_chart(
+                    history.set_index("Periodo")[["Costo/ora"]]
+                )
+
+            c3, c4 = st.columns(2)
+            with c3:
+                st.subheader("Ore e straordinari")
+                st.bar_chart(
+                    history.set_index("Periodo")[["Ore", "Straordinari"]]
+                )
+            with c4:
+                st.subheader("Costo per coperto")
+                st.line_chart(
+                    history.set_index("Periodo")[["Costo/coperto"]]
+                )
+
+            st.dataframe(
+                history,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab2:
+            department_costs = pd.Series(
+                current["department_costs"],
+                name="Costo gestionale",
+            ).sort_values(ascending=False)
+
+            department_hours = pd.Series(
+                current["department_hours"],
+                name="Ore approvate",
+            ).sort_values(ascending=False)
+
+            d1, d2 = st.columns(2)
+            with d1:
+                st.subheader("Costo per reparto")
+                if department_costs.empty:
+                    st.info("Nessun costo disponibile.")
+                else:
+                    st.bar_chart(department_costs)
+
+            with d2:
+                st.subheader("Ore per reparto")
+                if department_hours.empty:
+                    st.info("Nessuna ora approvata disponibile.")
+                else:
+                    st.bar_chart(department_hours)
+
+            department_rows = []
+            departments = sorted(
+                set(current["department_costs"])
+                | set(current["department_hours"])
+            )
+            for department in departments:
+                department_cost = float(
+                    current["department_costs"].get(department, 0)
+                )
+                department_hours_value = float(
+                    current["department_hours"].get(department, 0)
+                )
+                department_rows.append({
+                    "Reparto": department,
+                    "Costo": department_cost,
+                    "Ore": department_hours_value,
+                    "Costo/ora": (
+                        department_cost / department_hours_value
+                        if department_hours_value else 0
+                    ),
+                    "Peso sul costo %": (
+                        department_cost / current["management_cost"] * 100
+                        if current["management_cost"] else 0
+                    ),
+                })
+
+            department_df = pd.DataFrame(department_rows)
+            if not department_df.empty:
+                department_df["Costo"] = department_df["Costo"].map(euro)
+                department_df["Costo/ora"] = (
+                    department_df["Costo/ora"].map(euro)
+                )
+                department_df["Peso sul costo %"] = (
+                    department_df["Peso sul costo %"]
+                    .map(lambda value: f"{value:.1f}%")
+                )
+
+            st.dataframe(
+                department_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab3:
+            employee_df = current["df"].copy()
+            employee_df["Costo/ora"] = employee_df.apply(
+                lambda row: (
+                    row["management_cost"] / row["hours"]
+                    if row["hours"] else 0
+                ),
+                axis=1,
+            )
+            employee_df["Peso sul totale %"] = employee_df[
+                "management_cost"
+            ].apply(
+                lambda value: (
+                    value / current["management_cost"] * 100
+                    if current["management_cost"] else 0
+                )
+            )
+
+            employee_view = employee_df[[
+                "name",
+                "department",
+                "hours",
+                "gross_pay",
+                "company_cost",
+                "extra_cash",
+                "management_cost",
+                "Costo/ora",
+                "Peso sul totale %",
+            ]].copy()
+            employee_view.columns = [
+                "Dipendente",
+                "Reparto",
+                "Ore",
+                "Lordo",
+                "Costo azienda",
+                "Extra",
+                "Costo gestionale",
+                "Costo/ora",
+                "Peso sul totale %",
+            ]
+
+            for column in [
+                "Lordo",
+                "Costo azienda",
+                "Extra",
+                "Costo gestionale",
+                "Costo/ora",
+            ]:
+                employee_view[column] = employee_view[column].map(euro)
+
+            employee_view["Peso sul totale %"] = (
+                employee_view["Peso sul totale %"]
+                .map(lambda value: f"{value:.1f}%")
+            )
+
+            st.dataframe(
+                employee_view.sort_values(
+                    "Costo gestionale",
+                    ascending=False,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab4:
+            st.subheader("Lettura automatica dei dati")
+            for insight in personnel_bi_insights(current, previous):
+                st.write(f"• {insight}")
+
+            st.subheader("Confronto con il mese precedente")
+            comparison_rows = [
+                {
+                    "Indicatore": "Costo gestionale",
+                    "Mese corrente": euro(current["management_cost"]),
+                    "Mese precedente": euro(previous["management_cost"]),
+                    "Variazione": format_variation(cost_change),
+                },
+                {
+                    "Indicatore": "Incidenza personale",
+                    "Mese corrente": f"{current['incidence']:.1f}%",
+                    "Mese precedente": f"{previous['incidence']:.1f}%",
+                    "Variazione": (
+                        f"{incidence_delta:+.1f} pt"
+                        if incidence_delta is not None else "N/D"
+                    ),
+                },
+                {
+                    "Indicatore": "Ore lavorate",
+                    "Mese corrente": f"{current['hours']:.2f}",
+                    "Mese precedente": f"{previous['hours']:.2f}",
+                    "Variazione": format_variation(hours_change),
+                },
+                {
+                    "Indicatore": "Straordinari",
+                    "Mese corrente": f"{current['overtime']:.2f}",
+                    "Mese precedente": f"{previous['overtime']:.2f}",
+                    "Variazione": format_variation(overtime_change),
+                },
+                {
+                    "Indicatore": "Costo/coperto",
+                    "Mese corrente": euro(current["cost_per_cover"]),
+                    "Mese precedente": euro(previous["cost_per_cover"]),
+                    "Variazione": format_variation(
+                        variation_percent(
+                            current["cost_per_cover"],
+                            previous["cost_per_cover"],
+                        )
+                    ),
+                },
+            ]
+
+            st.dataframe(
+                pd.DataFrame(comparison_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
 
 elif section == "Importa costi":
     st.title("Importa prospetto costi paghe")

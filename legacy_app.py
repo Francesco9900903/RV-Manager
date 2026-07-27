@@ -2298,7 +2298,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.0</div>
+            <div class="rv-brand-subtitle">Enterprise 3.1 · AI Manager Pro</div>
         </div>
     </div>
     """,
@@ -2916,51 +2916,309 @@ elif section == "Business Intelligence":
 
 
 elif section == "AI Manager":
-    st.title("AI Manager del personale")
+    st.title("AI Manager Pro")
     st.caption(
-        "Analisi automatica basata sui dati reali del gestionale. "
-        "Non invia dati a servizi esterni."
+        "Analisi automatica del personale, priorità operative e suggerimenti "
+        "basati sui dati reali del gestionale."
     )
 
     current = personnel_bi_period(year, month)
     previous_year, previous_month = previous_period(year, month)
     previous = personnel_bi_period(previous_year, previous_month)
+    snapshot = manager_daily_snapshot(year, month)
+    expiry_items = document_expiry_snapshot(30)
+    unread_alerts = [
+        row for row in manager_notification_snapshot(50)
+        if not row["Letta"]
+    ]
 
     if current["df"].empty:
-        st.info("Non ci sono dati sufficienti per il periodo selezionato.")
+        st.info(
+            "Non ci sono ancora dati economici sufficienti per il periodo "
+            "selezionato. Le analisi operative restano comunque disponibili."
+        )
+
+    # Executive risk score.
+    risk_score = 0
+    risk_reasons = []
+
+    if current["incidence"] >= 35:
+        risk_score += 30
+        risk_reasons.append("Incidenza del personale elevata")
+    elif current["incidence"] >= 32:
+        risk_score += 18
+        risk_reasons.append("Incidenza del personale da monitorare")
+
+    if current["overtime"] >= 30:
+        risk_score += 22
+        risk_reasons.append("Straordinari molto elevati")
+    elif current["overtime"] >= 15:
+        risk_score += 12
+        risk_reasons.append("Straordinari in crescita")
+
+    if snapshot["pending_count"] >= 10:
+        risk_score += 15
+        risk_reasons.append("Molte registrazioni da approvare")
+    elif snapshot["pending_count"] > 0:
+        risk_score += 7
+        risk_reasons.append("Registrazioni in attesa")
+
+    if expiry_items:
+        high_expiry = sum(
+            1 for row in expiry_items
+            if row.get("Priorità") == "Alta"
+        )
+        risk_score += min(20, high_expiry * 5)
+        if high_expiry:
+            risk_reasons.append(
+                f"{high_expiry} documenti scaduti o in scadenza ravvicinata"
+            )
+
+    if snapshot["anomalies"]:
+        risk_score += min(20, len(snapshot["anomalies"]) * 4)
+        risk_reasons.append(
+            f"{len(snapshot['anomalies'])} anomalie operative"
+        )
+
+    risk_score = min(risk_score, 100)
+
+    if risk_score >= 70:
+        risk_label = "Critico"
+        risk_message = "Intervento consigliato oggi"
+    elif risk_score >= 40:
+        risk_label = "Attenzione"
+        risk_message = "Situazione da monitorare"
     else:
-        insights = build_personnel_insights(current, previous)
+        risk_label = "Regolare"
+        risk_message = "Nessuna criticità rilevante"
 
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Costo gestionale", euro(current["management_cost"]))
-        a2.metric("Incidenza", f"{current['incidence']:.1f}%")
-        a3.metric("Straordinari", f"{current['overtime']:.2f}")
-        a4.metric("Costo/coperto", euro(current["cost_per_cover"]))
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Indice di attenzione", f"{risk_score}/100")
+    h2.metric("Stato", risk_label)
+    h3.metric("Presenti ora", snapshot["present_now"])
+    h4.metric("Azioni aperte", len(unread_alerts) + snapshot["pending_count"])
 
-        st.subheader("Analisi e azioni suggerite")
-        for insight in insights:
-            render_insight(insight)
+    if risk_score >= 70:
+        st.error(f"**{risk_message}**")
+    elif risk_score >= 40:
+        st.warning(f"**{risk_message}**")
+    else:
+        st.success(f"**{risk_message}**")
 
-        st.subheader("Domande guidate")
+    tab_briefing, tab_actions, tab_analysis, tab_questions = st.tabs(
+        [
+            "Briefing del giorno",
+            "Azioni consigliate",
+            "Analisi del mese",
+            "Domande guidate",
+        ]
+    )
+
+    with tab_briefing:
+        st.subheader("Riepilogo operativo")
+
+        briefing_rows = [
+            {
+                "Indicatore": "Dipendenti presenti",
+                "Valore": (
+                    f"{snapshot['present_now']} su "
+                    f"{snapshot['active_employees']}"
+                ),
+                "Valutazione": (
+                    "Regolare" if snapshot["present_now"] > 0
+                    else "Nessun presente"
+                ),
+            },
+            {
+                "Indicatore": "Ore da approvare",
+                "Valore": snapshot["pending_count"],
+                "Valutazione": (
+                    "Da gestire" if snapshot["pending_count"] > 0
+                    else "Aggiornato"
+                ),
+            },
+            {
+                "Indicatore": "Anomalie operative",
+                "Valore": len(snapshot["anomalies"]),
+                "Valutazione": (
+                    "Da verificare" if snapshot["anomalies"]
+                    else "Nessuna"
+                ),
+            },
+            {
+                "Indicatore": "Documenti in scadenza",
+                "Valore": len(expiry_items),
+                "Valutazione": (
+                    "Da verificare" if expiry_items else "Nessuno"
+                ),
+            },
+            {
+                "Indicatore": "Straordinari del mese",
+                "Valore": f"{current['overtime']:.2f} ore",
+                "Valutazione": (
+                    "Elevati" if current["overtime"] >= 20
+                    else "Sotto controllo"
+                ),
+            },
+            {
+                "Indicatore": "Incidenza del personale",
+                "Valore": f"{current['incidence']:.1f}%",
+                "Valutazione": (
+                    "Elevata" if current["incidence"] >= 35
+                    else "Regolare"
+                ),
+            },
+        ]
+
+        st.dataframe(
+            pd.DataFrame(briefing_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if risk_reasons:
+            st.subheader("Motivi dell'indice di attenzione")
+            for reason in risk_reasons:
+                st.write(f"• {reason}")
+
+    with tab_actions:
+        st.subheader("Priorità operative")
+
+        actions = []
+
+        if snapshot["pending_count"] > 0:
+            actions.append({
+                "Priorità": "Alta",
+                "Azione": (
+                    f"Approva {snapshot['pending_count']} registrazioni ore."
+                ),
+                "Area": "Ore",
+            })
+
+        for anomaly in snapshot["anomalies"][:10]:
+            actions.append({
+                "Priorità": anomaly.get("Priorità", "Media"),
+                "Azione": (
+                    f"Controlla {anomaly.get('Dipendente', '')}: "
+                    f"{anomaly.get('Anomalia', '')}."
+                ),
+                "Area": "Presenze",
+            })
+
+        for item in expiry_items[:10]:
+            actions.append({
+                "Priorità": item.get("Priorità", "Media"),
+                "Azione": (
+                    f"Gestisci {item.get('Documento', '')} di "
+                    f"{item.get('Dipendente', '')}, scadenza "
+                    f"{item.get('Scadenza', '')}."
+                ),
+                "Area": "Documenti",
+            })
+
+        if current["overtime"] >= 20:
+            actions.append({
+                "Priorità": "Media",
+                "Azione": (
+                    f"Analizza le {current['overtime']:.2f} ore di "
+                    "straordinario del mese."
+                ),
+                "Area": "Costi",
+            })
+
+        if current["incidence"] >= 35:
+            actions.append({
+                "Priorità": "Alta",
+                "Azione": (
+                    f"Verifica l'incidenza del personale, attualmente "
+                    f"pari al {current['incidence']:.1f}%."
+                ),
+                "Area": "Business Intelligence",
+            })
+
+        if not actions:
+            actions.append({
+                "Priorità": "Bassa",
+                "Azione": "Nessuna azione urgente.",
+                "Area": "Generale",
+            })
+
+        st.dataframe(
+            pd.DataFrame(actions),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab_analysis:
+        if current["df"].empty:
+            st.info("Dati economici del mese non ancora disponibili.")
+        else:
+            insights = build_personnel_insights(current, previous)
+
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Costo gestionale", euro(current["management_cost"]))
+            a2.metric("Incidenza", f"{current['incidence']:.1f}%")
+            a3.metric("Straordinari", f"{current['overtime']:.2f}")
+            a4.metric("Costo/coperto", euro(current["cost_per_cover"]))
+
+            st.subheader("Interpretazione automatica")
+            for insight in insights:
+                render_insight(insight)
+
+            if current["department_costs"]:
+                st.subheader("Peso dei reparti")
+                department_series = pd.Series(
+                    current["department_costs"],
+                    name="Costo gestionale",
+                ).sort_values(ascending=False)
+                st.bar_chart(department_series)
+
+    with tab_questions:
+        st.subheader("Assistente guidato")
+
         question = st.selectbox(
-            "Cosa vuoi analizzare?",
+            "Scegli una domanda",
             [
+                "Quali sono le priorità di oggi?",
                 "Perché è cambiato il costo del personale?",
                 "Quale reparto pesa di più?",
                 "Gli straordinari sono sotto controllo?",
                 "L'incidenza del personale è sostenibile?",
+                "Quali documenti richiedono attenzione?",
             ],
         )
 
-        if question == "Perché è cambiato il costo del personale?":
+        if question == "Quali sono le priorità di oggi?":
+            if actions:
+                for item in actions[:6]:
+                    st.write(
+                        f"• **{item['Priorità']}** · {item['Azione']}"
+                    )
+            else:
+                st.success("Non risultano attività urgenti.")
+
+        elif question == "Perché è cambiato il costo del personale?":
             current_cost = current["management_cost"]
             previous_cost = previous["management_cost"]
             difference = current_cost - previous_cost
-            st.write(
-                f"Il costo è variato di **{euro(difference)}** rispetto al "
-                f"mese precedente. Verifica ore, extra, fringe e componenti "
-                f"una tantum nel dettaglio dipendenti."
+
+            if previous_cost:
+                delta = difference / previous_cost * 100
+                st.write(
+                    f"Il costo è variato di **{euro(difference)}**, "
+                    f"pari al **{delta:+.1f}%** rispetto al mese precedente."
+                )
+            else:
+                st.write(
+                    f"Il costo del mese è **{euro(current_cost)}**. "
+                    "Manca un periodo precedente confrontabile."
+                )
+
+            st.info(
+                "Controlla in Business Intelligence ore, extra, fringe, "
+                "straordinari e costo per reparto."
             )
+
         elif question == "Quale reparto pesa di più?":
             if current["department_costs"]:
                 department = max(
@@ -2968,35 +3226,63 @@ elif section == "AI Manager":
                     key=current["department_costs"].get,
                 )
                 value = current["department_costs"][department]
+                share = (
+                    value / current["management_cost"] * 100
+                    if current["management_cost"] else 0
+                )
                 st.write(
                     f"Il reparto con il costo maggiore è **{department}**, "
-                    f"con **{euro(value)}**."
+                    f"con **{euro(value)}**, pari al **{share:.1f}%** "
+                    "del totale."
                 )
             else:
                 st.info("Non sono disponibili costi per reparto.")
+
         elif question == "Gli straordinari sono sotto controllo?":
-            if current["overtime"] >= 20:
+            if current["overtime"] >= 30:
+                st.error(
+                    f"Risultano **{current['overtime']:.2f} ore** di "
+                    "straordinario: livello elevato."
+                )
+            elif current["overtime"] >= 15:
                 st.warning(
-                    f"Risultano {current['overtime']:.2f} ore di straordinario. "
-                    "È consigliabile verificare il dettaglio per dipendente."
+                    f"Risultano **{current['overtime']:.2f} ore** di "
+                    "straordinario: situazione da monitorare."
                 )
             else:
                 st.success(
                     f"Gli straordinari risultano pari a "
-                    f"{current['overtime']:.2f} ore."
+                    f"**{current['overtime']:.2f} ore**."
                 )
-        else:
-            if current["incidence"] >= 35:
+
+        elif question == "L'incidenza del personale è sostenibile?":
+            incidence = current["incidence"]
+            if incidence >= 35:
                 st.error(
-                    f"L'incidenza è {current['incidence']:.1f}%, "
-                    "quindi richiede attenzione."
+                    f"L'incidenza è **{incidence:.1f}%**: livello elevato."
                 )
-            elif current["incidence"] > 0:
+            elif incidence >= 32:
+                st.warning(
+                    f"L'incidenza è **{incidence:.1f}%**: richiede attenzione."
+                )
+            elif incidence > 0:
                 st.success(
-                    f"L'incidenza è {current['incidence']:.1f}%."
+                    f"L'incidenza è **{incidence:.1f}%**."
                 )
             else:
                 st.info("Manca il fatturato del mese.")
+
+        else:
+            if not expiry_items:
+                st.success(
+                    "Non risultano documenti in scadenza nei prossimi 30 giorni."
+                )
+            else:
+                st.dataframe(
+                    pd.DataFrame(expiry_items),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 elif section == "Registro eventi":
     st.title("Registro eventi aziendali")

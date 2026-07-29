@@ -1,5 +1,7 @@
 
 import re
+import json
+import hashlib
 from datetime import date, datetime, timedelta, time
 from io import BytesIO
 
@@ -2786,7 +2788,7 @@ def export_backup_manifest():
     manifest = {
         "generated_at": now_rome().isoformat(),
         "application": "RV Manager Enterprise",
-        "version": "3.4.0",
+        "version": "4.1.0",
         "tables": {},
     }
 
@@ -2819,6 +2821,161 @@ def export_backup_manifest():
             }
 
     return manifest
+
+
+BACKUP_BUCKET = "system-backups"
+
+def backup_bytes_and_metadata(backup_type="manuale"):
+    manifest = export_backup_manifest()
+    manifest["backup_type"] = backup_type
+    manifest["version"] = "4.1.0"
+
+    payload = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    checksum = hashlib.sha256(payload).hexdigest()
+    generated = now_rome()
+    filename = (
+        f"rv_manager_{backup_type}_"
+        f"{generated.strftime('%Y%m%d_%H%M%S')}.json"
+    )
+
+    return {
+        "manifest": manifest,
+        "bytes": payload,
+        "checksum": checksum,
+        "filename": filename,
+        "size_bytes": len(payload),
+        "generated_at": generated,
+    }
+
+def register_backup_record(metadata, status="completato", error_message=""):
+    row = {
+        "backup_type": metadata.get("backup_type", "manuale"),
+        "file_name": metadata.get("filename", ""),
+        "storage_path": metadata.get("storage_path", ""),
+        "size_bytes": int(metadata.get("size_bytes") or 0),
+        "checksum_sha256": metadata.get("checksum", ""),
+        "status": status,
+        "error_message": error_message,
+        "created_at": metadata.get("created_at") or now_rome().isoformat(),
+    }
+    return sb.table("backup_registry").insert(row).execute()
+
+def create_cloud_backup(backup_type="manuale"):
+    package = backup_bytes_and_metadata(backup_type)
+    storage_path = (
+        f"{package['generated_at'].strftime('%Y/%m/%d')}/"
+        f"{package['filename']}"
+    )
+
+    sb.storage.from_(BACKUP_BUCKET).upload(
+        storage_path,
+        package["bytes"],
+        {
+            "content-type": "application/json",
+            "upsert": "false",
+        },
+    )
+
+    metadata = {
+        "backup_type": backup_type,
+        "filename": package["filename"],
+        "storage_path": storage_path,
+        "size_bytes": package["size_bytes"],
+        "checksum": package["checksum"],
+        "created_at": package["generated_at"].isoformat(),
+    }
+    register_backup_record(metadata)
+
+    audit(
+        "backup_exported",
+        f"Backup {backup_type} completato",
+        entity_type="system_backup",
+        details={
+            "file_name": package["filename"],
+            "storage_path": storage_path,
+            "size_bytes": package["size_bytes"],
+            "checksum_sha256": package["checksum"],
+        },
+    )
+
+    package["storage_path"] = storage_path
+    return package
+
+def list_backup_records(limit=30):
+    try:
+        return (
+            sb.table("backup_registry")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute().data or []
+        )
+    except Exception:
+        return []
+
+def get_backup_settings():
+    defaults = {
+        "enabled": False,
+        "frequency": "giornaliero",
+        "run_hour": 2,
+        "retention_count": 30,
+        "last_run_at": None,
+        "next_run_at": None,
+    }
+    try:
+        rows = (
+            sb.table("backup_settings")
+            .select("*")
+            .eq("id", 1)
+            .limit(1)
+            .execute().data or []
+        )
+        if rows:
+            defaults.update(rows[0])
+    except Exception:
+        pass
+    return defaults
+
+def save_backup_settings(enabled, frequency, run_hour, retention_count):
+    payload = {
+        "id": 1,
+        "enabled": bool(enabled),
+        "frequency": frequency,
+        "run_hour": int(run_hour),
+        "retention_count": int(retention_count),
+        "updated_at": now_rome().isoformat(),
+    }
+    return (
+        sb.table("backup_settings")
+        .upsert(payload, on_conflict="id")
+        .execute()
+    )
+
+def verify_backup_integrity(record):
+    storage_path = record.get("storage_path")
+    expected_checksum = record.get("checksum_sha256")
+    if not storage_path or not expected_checksum:
+        return False, "Dati di verifica incompleti."
+
+    payload = sb.storage.from_(BACKUP_BUCKET).download(storage_path)
+    actual_checksum = hashlib.sha256(payload).hexdigest()
+    if actual_checksum == expected_checksum:
+        return True, "Integrità verificata: il file non risulta alterato."
+    return False, "La firma del file non corrisponde: backup da controllare."
+
+def backup_size_label(size_bytes):
+    size = float(size_bytes or 0)
+    if size < 1024:
+        return f"{int(size)} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
 
 
 def runtime_environment_snapshot():
@@ -3042,36 +3199,36 @@ def system_health_snapshot():
 
     # 6. Ultimo backup registrato.
     try:
-        backup_rows = (
-            sb.table("system_events")
-            .select("created_at,title")
-            .eq("event_type", "backup_exported")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute().data or []
-        )
+        backup_rows = list_backup_records(limit=1)
         if backup_rows:
-            backup_date = format_datetime_it(backup_rows[0].get("created_at"))
+            latest = backup_rows[0]
+            backup_date = format_datetime_it(latest.get("created_at"))
+            backup_ok = latest.get("status") == "completato"
             add_check(
                 "Backup applicativo",
-                True,
-                f"Ultimo backup registrato: {backup_date}.",
+                backup_ok,
+                (
+                    f"Ultimo backup completato: {backup_date}."
+                    if backup_ok
+                    else "L'ultimo backup richiede verifica."
+                ),
                 "Continuità operativa",
+                latest.get("error_message", ""),
             )
         else:
             add_check(
                 "Backup applicativo",
                 False,
-                "Nessun backup registrato nel Registro eventi.",
+                "Nessun backup ancora presente. Esegui il primo backup manuale.",
                 "Continuità operativa",
             )
-    except Exception:
+    except Exception as exc:
         add_check(
             "Backup applicativo",
             False,
-            "Il controllo backup non è ancora configurato per questa installazione.",
+            "Il centro backup richiede la migrazione Enterprise 4.1.",
             "Continuità operativa",
-            "La tabella o l'evento di backup non sono disponibili oppure non sono leggibili.",
+            technical_error_text(exc),
         )
 
     # 7. Versione.
@@ -3079,7 +3236,7 @@ def system_health_snapshot():
         from rv_manager import __version__
         version_text = __version__
     except Exception:
-        version_text = "4.0.0"
+        version_text = "4.1.0"
 
     add_check(
         "Versione software",
@@ -3099,7 +3256,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 4.0 · Affidabilità</div>
+            <div class="rv-brand-subtitle">Enterprise 4.1 · Backup integrato</div>
         </div>
     </div>
     """,
@@ -5218,6 +5375,209 @@ elif section == "Stato del sistema":
             left.markdown(f"### {health_status_icon(row['Stato'])}")
             right.markdown(f"**{row['Controllo']}**")
             right.caption(row["Dettaglio"])
+
+
+    st.divider()
+    st.subheader("Centro backup")
+    st.caption(
+        "Backup manuali e automatici sono gestiti qui, senza aggiungere "
+        "nuove voci al menu."
+    )
+
+    backup_records = list_backup_records(limit=30)
+    latest_backup = backup_records[0] if backup_records else None
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric(
+        "Ultimo backup",
+        format_datetime_it(latest_backup.get("created_at"))
+        if latest_backup else "Mai eseguito",
+    )
+    b2.metric(
+        "Tipo",
+        translate_it(latest_backup.get("backup_type")).capitalize()
+        if latest_backup else "—",
+    )
+    b3.metric(
+        "Dimensione",
+        backup_size_label(latest_backup.get("size_bytes"))
+        if latest_backup else "—",
+    )
+    b4.metric(
+        "Integrità",
+        "Da verificare" if latest_backup else "—",
+    )
+
+    st.markdown("#### Backup manuale")
+    manual_col1, manual_col2 = st.columns(2)
+
+    if manual_col1.button(
+        "Esegui backup adesso",
+        type="primary",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("Creazione e archiviazione del backup..."):
+                package = create_cloud_backup("manuale")
+            st.session_state["ultimo_backup_generato"] = package
+            st.success(
+                f"Backup completato: {package['filename']} "
+                f"({backup_size_label(package['size_bytes'])})."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                "Backup non completato. Verifica di aver eseguito la "
+                "migrazione Enterprise 4.1 e che il bucket sia disponibile."
+            )
+            with st.expander("Dettaglio tecnico"):
+                st.code(technical_error_text(exc))
+
+    generated_backup = st.session_state.get("ultimo_backup_generato")
+    if generated_backup:
+        manual_col2.download_button(
+            "Scarica ultimo backup creato",
+            data=generated_backup["bytes"],
+            file_name=generated_backup["filename"],
+            mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        manual_col2.button(
+            "Scarica ultimo backup creato",
+            disabled=True,
+            use_container_width=True,
+        )
+
+    st.markdown("#### Backup automatici")
+    settings = get_backup_settings()
+
+    with st.form("configurazione_backup_automatici"):
+        auto_enabled = st.toggle(
+            "Backup automatici attivi",
+            value=bool(settings.get("enabled")),
+        )
+        s1, s2, s3 = st.columns(3)
+        frequency_options = ["giornaliero", "settimanale", "mensile"]
+        current_frequency = settings.get("frequency", "giornaliero")
+        frequency_index = (
+            frequency_options.index(current_frequency)
+            if current_frequency in frequency_options else 0
+        )
+        auto_frequency = s1.selectbox(
+            "Frequenza",
+            frequency_options,
+            index=frequency_index,
+        )
+        auto_hour = s2.number_input(
+            "Ora di esecuzione",
+            min_value=0,
+            max_value=23,
+            value=int(settings.get("run_hour") or 2),
+            step=1,
+        )
+        retention_count = s3.number_input(
+            "Backup da conservare",
+            min_value=3,
+            max_value=365,
+            value=int(settings.get("retention_count") or 30),
+            step=1,
+        )
+
+        save_auto = st.form_submit_button(
+            "Salva configurazione backup",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if save_auto:
+        try:
+            save_backup_settings(
+                auto_enabled,
+                auto_frequency,
+                auto_hour,
+                retention_count,
+            )
+            st.success("Configurazione dei backup automatici salvata.")
+        except Exception as exc:
+            st.error(
+                "Configurazione non salvata. Esegui la migrazione "
+                "Enterprise 4.1."
+            )
+            with st.expander("Dettaglio tecnico"):
+                st.code(technical_error_text(exc))
+
+    st.info(
+        "L'esecuzione automatica affidabile viene effettuata dal processo "
+        "programmato incluso nel pacchetto. Dopo l'installazione occorre "
+        "configurare i due Secrets GitHub SUPABASE_URL e "
+        "SUPABASE_SECRET_KEY."
+    )
+
+    st.markdown("#### Storico backup")
+    if backup_records:
+        history_rows = []
+        for row in backup_records:
+            history_rows.append({
+                "Data": format_datetime_it(row.get("created_at")),
+                "Tipo": translate_it(row.get("backup_type")).capitalize(),
+                "Dimensione": backup_size_label(row.get("size_bytes")),
+                "Stato": translate_it(row.get("status")).capitalize(),
+                "Nome file": row.get("file_name", ""),
+                "Percorso": row.get("storage_path", ""),
+            })
+        st.dataframe(
+            pd.DataFrame(history_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selected_backup = st.selectbox(
+            "Backup da verificare o scaricare",
+            options=backup_records,
+            format_func=lambda row: (
+                f"{format_datetime_it(row.get('created_at'))} · "
+                f"{row.get('backup_type', '').capitalize()} · "
+                f"{row.get('file_name', '')}"
+            ),
+        )
+
+        action1, action2 = st.columns(2)
+        if action1.button(
+            "Verifica integrità",
+            use_container_width=True,
+        ):
+            try:
+                ok, message = verify_backup_integrity(selected_backup)
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
+            except Exception as exc:
+                st.error("Verifica non completata.")
+                with st.expander("Dettaglio tecnico"):
+                    st.code(technical_error_text(exc))
+
+        try:
+            selected_payload = sb.storage.from_(BACKUP_BUCKET).download(
+                selected_backup.get("storage_path")
+            )
+            action2.download_button(
+                "Scarica backup selezionato",
+                data=selected_payload,
+                file_name=selected_backup.get("file_name", "backup.json"),
+                mime="application/json",
+                use_container_width=True,
+            )
+        except Exception:
+            action2.button(
+                "Scarica backup selezionato",
+                disabled=True,
+                use_container_width=True,
+            )
+    else:
+        st.info("Nessun backup presente nello storico.")
+
 
     with st.expander("Dettagli tecnici per amministratori"):
         technical_df = pd.DataFrame(health_rows)[

@@ -1,13 +1,19 @@
 """
-RV Manager Enterprise 2.0
-
-Entry point modulare. La UI legacy resta temporaneamente isolata in
-`legacy_app.py`, mentre i nuovi moduli vengono spostati nel package
-`rv_manager`. Questo consente una migrazione progressiva senza perdere
-le funzionalità già collaudate.
+RV Manager Enterprise 3.5
+Entry point stabile con caricamento controllato della UI legacy.
 """
 from pathlib import Path
+import sys
 
-LEGACY_PATH = Path(__file__).with_name("legacy_app.py")
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+LEGACY_PATH = ROOT / "legacy_app.py"
+
+if not LEGACY_PATH.exists():
+    raise FileNotFoundError(f"File mancante: {LEGACY_PATH}")
+
 source = LEGACY_PATH.read_text(encoding="utf-8")
-exec(compile(source, str(LEGACY_PATH), "exec"), globals(), globals())
+compiled = compile(source, str(LEGACY_PATH), "exec")
+exec(compiled, globals(), globals())

@@ -16,6 +16,10 @@ except ModuleNotFoundError:
     from event_log import log_event, recent_events
     from ui import render_insight
 from zoneinfo import ZoneInfo
+try:
+    from rv_manager.employee_portal_utils import approved_hours_summary, current_period
+except ModuleNotFoundError:
+    from employee_portal_utils import approved_hours_summary, current_period
 
 st.set_page_config(page_title="RV Manager Enterprise", page_icon="◈", layout="wide")
 
@@ -313,10 +317,19 @@ st.markdown(
         box-shadow: 0 6px 16px rgba(23,32,51,0.11);
     }
 
-    button[kind="primary"] {
-        background: var(--rv-accent);
-        border-color: var(--rv-accent);
-        color: white;
+    button[kind="primary"],
+    .stFormSubmitButton button[kind="primary"],
+    .stButton button[kind="primary"] {
+        background: var(--rv-accent) !important;
+        border-color: var(--rv-accent) !important;
+        color: #ffffff !important;
+    }
+
+    button[kind="primary"] *,
+    .stFormSubmitButton button[kind="primary"] *,
+    .stButton button[kind="primary"] * {
+        color: #ffffff !important;
+        fill: #ffffff !important;
     }
 
     /* Alert */
@@ -529,8 +542,144 @@ def supabase_public():
     return create_client(url, key)
 
 
+
 sb = supabase_admin()
 public_sb = supabase_public()
+
+ITALIAN_TRANSLATIONS = {
+    # Stati
+    "approved": "Approvato",
+    "submitted": "Da approvare",
+    "rejected": "Rifiutato",
+    "published": "Pubblicato",
+    "archived": "Archiviato",
+    "draft": "Bozza",
+    "open": "Aperto",
+    "closed": "Chiuso",
+    "active": "Attivo",
+    "inactive": "Non attivo",
+    "manager": "Responsabile",
+    "employee": "Dipendente",
+    "admin": "Amministratore",
+    "owner": "Titolare",
+    "general": "Generale",
+    "payslip": "Busta paga",
+    "document": "Documento",
+    # Gravità
+    "info": "Informazione",
+    "warning": "Avviso",
+    "critical": "Critico",
+    "success": "Completato",
+    # Tipi evento
+    "monthly_data_updated": "Dati mensili aggiornati",
+    "employee_created": "Dipendente creato",
+    "employee_account_created": "Account dipendente creato",
+    "employee_account_linked": "Account dipendente associato",
+    "clock_in": "Entrata registrata",
+    "clock_out": "Uscita registrata",
+    "timesheet_submitted": "Ore inviate",
+    "timesheet_admin_saved": "Ore inserite dal responsabile",
+    "timesheet_approved": "Ore approvate",
+    "timesheet_rejected": "Ore rifiutate",
+    "payroll_costs_imported": "Costi paghe importati",
+    "payslip_published": "Busta paga pubblicata",
+    "employee_document_published": "Documento pubblicato",
+    "employee_document_archived": "Documento archiviato",
+    "fringe_benefit_created": "Fringe benefit registrato",
+    "extra_payment_created": "Altro costo registrato",
+    "backup_exported": "Backup esportato",
+    "qa_completed": "Collaudo completato",
+    # Entità
+    "employee": "Dipendente",
+    "employee_account": "Account dipendente",
+    "clock_entry": "Timbratura",
+    "timesheet": "Registrazione ore",
+    "monthly_costs": "Costi mensili",
+    "monthly_revenue": "Dati del mese",
+    "payslip": "Busta paga",
+    "employee_document": "Documento dipendente",
+    "fringe_benefit": "Fringe benefit",
+    "extra_payment": "Altro costo",
+    "system_backup": "Backup del sistema",
+    "quality_assurance": "Collaudo",
+}
+
+def translate_it(value):
+    if value is None:
+        return ""
+    text = str(value)
+    return ITALIAN_TRANSLATIONS.get(text, ITALIAN_TRANSLATIONS.get(text.lower(), text))
+
+def format_date_it(value):
+    """Restituisce sempre le date come giorno/mese/anno."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        return value.astimezone(ROME_TZ).strftime("%d/%m/%Y")
+    if isinstance(value, date):
+        return value.strftime("%d/%m/%Y")
+
+    text = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(ROME_TZ)
+        return parsed.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).strftime("%d/%m/%Y")
+        except Exception:
+            continue
+    return text
+
+def format_datetime_it(value):
+    """Data italiana e ora locale: giorno/mese/anno ore:minuti."""
+    if value is None or value == "":
+        return ""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC_TZ)
+        return parsed.astimezone(ROME_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return format_date_it(value)
+
+def localize_dataframe_it(dataframe):
+    if not isinstance(dataframe, pd.DataFrame):
+        return dataframe
+
+    result = dataframe.copy()
+    date_words = (
+        "data", "giorno", "scadenza", "creata", "creato",
+        "aggiornata", "aggiornato", "timestamp"
+    )
+    datetime_words = ("creata", "creato", "aggiornata", "aggiornato", "ora")
+
+    for column in result.columns:
+        column_text = str(column).lower()
+        if any(word in column_text for word in date_words):
+            formatter = (
+                format_datetime_it
+                if any(word in column_text for word in datetime_words)
+                else format_date_it
+            )
+            result[column] = result[column].map(formatter)
+
+        if result[column].dtype == object:
+            result[column] = result[column].map(translate_it)
+
+    return result
+
+# Tutte le tabelle dell'app ereditano automaticamente formato e termini italiani.
+_original_dataframe = st.dataframe
+
+def dataframe_italiano(data=None, *args, **kwargs):
+    return _original_dataframe(localize_dataframe_it(data), *args, **kwargs)
+
+st.dataframe = dataframe_italiano
 
 def current_actor_user_id():
     try:
@@ -814,8 +963,11 @@ def month_data(year, month):
         x_map[x["employee_id"]] = x_map.get(x["employee_id"], 0) + float(x["amount"] or 0)
 
     df["fringe"] = df["employee_id"].map(f_map).fillna(0)
-    df["extra_cash"] = df["employee_id"].map(x_map).fillna(0)
-    df["management_cost"] = df["company_cost"] + df["extra_cash"]
+    df["other_cost"] = df["employee_id"].map(x_map).fillna(0)
+    # Compatibilità con analisi precedenti.
+    df["extra_cash"] = df["other_cost"]
+    # Gli extra del mese vengono sommati al costo importato del dipendente.
+    df["management_cost"] = df["company_cost"] + df["other_cost"]
 
     rev = (
         sb.table("monthly_revenue").select("revenue,covers")
@@ -1271,9 +1423,6 @@ def employee_portal():
         )
 
         open_shift_home = current_open_shift(employee_id, public_sb)
-        today = datetime.now(ROME_TZ)
-        year = today.year
-        month = today.month
         month_start_home, month_end_home = month_bounds(year, month)
         home_timesheets = (
             public_sb.table("timesheets")
@@ -1283,19 +1432,9 @@ def employee_portal():
             .lt("work_date", month_end_home.isoformat())
             .execute().data or []
         )
-        approved_home = [
-            row for row in home_timesheets
-            if row.get("status") == "approved"
-        ]
-        home_hours = sum(
-            float(row.get("ordinary_hours") or 0)
-            + float(row.get("overtime_hours") or 0)
-            for row in approved_home
-        )
-        home_overtime = sum(
-            float(row.get("overtime_hours") or 0)
-            for row in approved_home
-        )
+        approved_summary = approved_hours_summary(home_timesheets)
+        home_hours = approved_summary["total"]
+        home_overtime = approved_summary["overtime"]
 
         if open_shift_home:
             started_home = parse_db_datetime(open_shift_home.get("clock_in"))
@@ -2681,13 +2820,68 @@ def export_backup_manifest():
 
     return manifest
 
+
+def runtime_environment_snapshot():
+    try:
+        cfg = st.secrets.get("app", {})
+    except Exception:
+        cfg = {}
+
+    environment = str(cfg.get("environment", "production")).strip().lower()
+    project_label = str(cfg.get("project_label", "RV Manager")).strip()
+    allow_real_data = bool(cfg.get("allow_real_data", environment == "production"))
+
+    return {
+        "environment": environment,
+        "project_label": project_label,
+        "allow_real_data": allow_real_data,
+        "is_production": environment == "production",
+        "is_staging": environment == "staging",
+    }
+
+def rls_diagnostic_snapshot():
+    results = []
+
+    table_names = [
+        "employee_accounts",
+        "timesheets",
+        "clock_entries",
+        "payslips",
+        "employee_documents",
+        "employee_notifications",
+    ]
+
+    for table_name in table_names:
+        try:
+            response = (
+                sb.table("rls_diagnostic")
+                .select("table_name,rls_enabled,policy_count")
+                .eq("table_name", table_name)
+                .limit(1)
+                .execute()
+            )
+            row = (response.data or [{}])[0]
+            results.append({
+                "Tabella": table_name,
+                "RLS": "ATTIVA" if row.get("rls_enabled") else "NON VERIFICATA",
+                "Policy": int(row.get("policy_count") or 0),
+            })
+        except Exception:
+            results.append({
+                "Tabella": table_name,
+                "RLS": "DIAGNOSTICA NON INSTALLATA",
+                "Policy": 0,
+            })
+
+    return results
+
 st.sidebar.markdown(
     """
     <div class="rv-brand">
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.4 · Sicurezza e collaudo</div>
+            <div class="rv-brand-subtitle">Enterprise 3.7 · Usabilità e costi</div>
         </div>
     </div>
     """,
@@ -2708,6 +2902,7 @@ MENU_ICONS = {
     "Centro documenti": "□",
     "Centro notifiche": "●",
     "Sicurezza e collaudo": "⚿",
+    "Ambiente e RLS": "◈",
     "Fringe benefit": "◆",
     "Extra da regolarizzare": "△",
     "Dati del mese": "▦",
@@ -2727,17 +2922,30 @@ MENU_ITEMS = [
     "Centro documenti",
     "Centro notifiche",
     "Sicurezza e collaudo",
+    "Ambiente e RLS",
     "Fringe benefit",
     "Extra da regolarizzare",
     "Dati del mese",
 ]
+
+def vai_a_sezione(nome_sezione):
+    st.session_state["navigazione_principale"] = nome_sezione
 
 section = st.sidebar.radio(
     "Navigazione",
     MENU_ITEMS,
     format_func=lambda item: f"{MENU_ICONS[item]}  {item}",
     label_visibility="collapsed",
+    key="navigazione_principale",
 )
+
+env_info = runtime_environment_snapshot()
+if env_info["is_staging"]:
+    st.sidebar.warning("AMBIENTE STAGING · usare solo dati fittizi")
+elif env_info["is_production"]:
+    st.sidebar.success("AMBIENTE PRODUZIONE")
+else:
+    st.sidebar.info(f"AMBIENTE: {env_info['environment'].upper()}")
 
 today = date.today()
 years = list(range(2025, today.year + 2))
@@ -2900,7 +3108,7 @@ if section == "Cruscotto":
 
             s1, s2, s3, s4 = st.columns(4)
             s1.metric("Costo aziendale", euro(official))
-            s2.metric("Extra registrati", euro(extra))
+            s2.metric("Altro costo", euro(extra))
             s3.metric("Fringe benefit", euro(fringe))
             s4.metric("Costo gestionale", euro(total))
 
@@ -2914,15 +3122,15 @@ if section == "Cruscotto":
 
             view = df[[
                 "name", "department", "hours", "net_pay", "gross_pay",
-                "company_cost", "fringe", "extra_cash", "management_cost"
+                "company_cost", "fringe", "other_cost", "management_cost"
             ]].copy()
             view.columns = [
                 "Dipendente", "Reparto", "Ore", "Netto", "Lordo",
-                "Costo azienda", "Fringe", "Extra", "Costo gestionale"
+                "Costo azienda", "Fringe", "Altro costo", "Costo gestionale"
             ]
             for column in [
                 "Netto", "Lordo", "Costo azienda",
-                "Fringe", "Extra", "Costo gestionale"
+                "Fringe", "Altro costo", "Costo gestionale"
             ]:
                 view[column] = view[column].map(euro)
 
@@ -3040,10 +3248,44 @@ if section == "Cruscotto":
 
     st.subheader("Accesso rapido")
     q1, q2, q3, q4 = st.columns(4)
-    q1.info("👥 Dipendenti")
-    q2.info("⏰ Ore e approvazioni")
-    q3.info("📄 Documenti e buste paga")
-    q4.info("🔔 Notifiche e scadenze")
+    q1.button(
+        "👥 Dipendenti",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("Dipendenti",),
+    )
+    q2.button(
+        "⏰ Ore e approvazioni",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("Ore e approvazioni",),
+    )
+    q3.button(
+        "📄 Centro documenti",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("Centro documenti",),
+    )
+    q4.button(
+        "🔔 Notifiche e scadenze",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("Centro notifiche",),
+    )
+
+    q5, q6 = st.columns(2)
+    q5.button(
+        "▤ Buste paga",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("Buste paga",),
+    )
+    q6.button(
+        "✦ AI Manager",
+        use_container_width=True,
+        on_click=vai_a_sezione,
+        args=("AI Manager",),
+    )
 
 
 elif section == "Business Intelligence":
@@ -3256,7 +3498,7 @@ elif section == "Business Intelligence":
                 "hours",
                 "gross_pay",
                 "company_cost",
-                "extra_cash",
+                "other_cost",
                 "management_cost",
                 "Costo/ora",
                 "Peso sul totale %",
@@ -3267,7 +3509,7 @@ elif section == "Business Intelligence":
                 "Ore",
                 "Lordo",
                 "Costo azienda",
-                "Extra",
+                "Altro costo",
                 "Costo gestionale",
                 "Costo/ora",
                 "Peso sul totale %",
@@ -3276,7 +3518,7 @@ elif section == "Business Intelligence":
             for column in [
                 "Lordo",
                 "Costo azienda",
-                "Extra",
+                "Altro costo",
                 "Costo gestionale",
                 "Costo/ora",
             ]:
@@ -3737,22 +3979,22 @@ elif section == "Registro eventi":
         for event in events:
             employee = event.get("employees") or {}
             rows.append({
-                "Data": event.get("created_at", ""),
-                "Tipo": event.get("event_type", ""),
-                "Titolo": event.get("title", ""),
-                "Gravità": event.get("severity", ""),
+                "Data": format_datetime_it(event.get("created_at")),
+                "Operazione": translate_it(event.get("event_type")),
+                "Descrizione": translate_it(event.get("title")),
+                "Livello": translate_it(event.get("severity")),
                 "Dipendente": employee.get("name", ""),
-                "Entità": event.get("entity_type", ""),
-                "ID entità": event.get("entity_id", ""),
+                "Elemento": translate_it(event.get("entity_type")),
+                "Identificativo": event.get("entity_id", ""),
             })
 
         event_df = pd.DataFrame(rows)
         filter_type = st.selectbox(
             "Filtra per tipo",
-            ["Tutti"] + sorted(event_df["Tipo"].dropna().unique().tolist()),
+            ["Tutte"] + sorted(event_df["Operazione"].dropna().unique().tolist()),
         )
-        if filter_type != "Tutti":
-            event_df = event_df[event_df["Tipo"] == filter_type]
+        if filter_type != "Tutte":
+            event_df = event_df[event_df["Operazione"] == filter_type]
 
         st.dataframe(
             event_df,
@@ -3781,7 +4023,7 @@ elif section == "Importa costi":
         c1, c2 = st.columns(2)
         hours = c1.number_input("Ore del mese", min_value=0.0, step=0.5)
         net = c2.number_input("Netto in busta", min_value=0.0, step=10.0)
-        if st.button("Salva ore e netto"):
+        if st.button("Salva ore e netto", type="primary"):
             sb.table("monthly_costs").upsert({
                 "employee_id": employee_id, "year": year, "month": month,
                 "hours": hours, "net_pay": net
@@ -3827,7 +4069,7 @@ elif section == "Dipendenti":
                 "active": st.column_config.CheckboxColumn("Attivo")
             }
         )
-        if st.button("Salva modifiche"):
+        if st.button("Salva modifiche", type="primary"):
             for _, r in edited.iterrows():
                 sb.table("employees").update({
                     "department": r["department"],
@@ -4240,6 +4482,7 @@ elif section == "Centro documenti":
             expiry_date = st.date_input(
                 "Data di scadenza",
                 value=date.today() + timedelta(days=365),
+                format="DD/MM/YYYY",
             )
 
         uploaded_document = st.file_uploader(
@@ -4640,7 +4883,7 @@ elif section == "Sicurezza e collaudo":
 
         if passed_count == len(results):
             st.success("Collaudo completo.")
-            if st.button("Registra collaudo completato"):
+            if st.button("Registra collaudo completato", type="primary"):
                 audit(
                     "qa_completed",
                     "Checklist di collaudo completata",
@@ -4688,6 +4931,70 @@ elif section == "Sicurezza e collaudo":
         )
 
 
+
+elif section == "Ambiente e RLS":
+    st.title("Ambiente e sicurezza RLS")
+    st.caption(
+        "Verifica separazione tra produzione e staging e stato delle policy "
+        "sulle tabelle sensibili."
+    )
+
+    env_info = runtime_environment_snapshot()
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Ambiente", env_info["environment"].upper())
+    e2.metric("Progetto", env_info["project_label"])
+    e3.metric(
+        "Dati reali consentiti",
+        "Sì" if env_info["allow_real_data"] else "No",
+    )
+
+    if env_info["is_staging"]:
+        st.warning(
+            "Stai lavorando in STAGING. Usa esclusivamente dati fittizi o "
+            "anonimizzati."
+        )
+    elif env_info["is_production"]:
+        st.error(
+            "Stai lavorando in PRODUZIONE. Evita prove distruttive e carica "
+            "solo modifiche già collaudate."
+        )
+    else:
+        st.info("Ambiente personalizzato rilevato.")
+
+    st.subheader("Diagnostica RLS")
+    rls_rows = rls_diagnostic_snapshot()
+    st.dataframe(
+        pd.DataFrame(rls_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if any(row["RLS"] != "ATTIVA" for row in rls_rows):
+        st.warning(
+            "La diagnostica RLS non è completa oppure alcune tabelle non "
+            "risultano verificate. Esegui la migrazione diagnostica 3.6."
+        )
+    else:
+        st.success("Le tabelle sensibili risultano con RLS attiva.")
+
+    st.subheader("Test manuale obbligatorio")
+    st.markdown(
+        """
+        1. Accedi con un dipendente A e annota i suoi documenti.
+        2. Accedi con un dipendente B.
+        3. Verifica che B non veda documenti, buste paga, ore o notifiche di A.
+        4. Ripeti il test invertendo gli account.
+        5. Esegui lo stesso controllo nell'ambiente staging prima di ogni rilascio.
+        """
+    )
+
+    st.info(
+        "Il pannello diagnostico non sostituisce i test reali con account "
+        "differenti."
+    )
+
+
 elif section == "Fringe benefit":
     st.title("Fringe benefit")
     employees = employees_df()
@@ -4695,11 +5002,11 @@ elif section == "Fringe benefit":
         with st.form("fringe"):
             name = st.selectbox("Dipendente", employees["name"].tolist())
             employee_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
-            d = st.date_input("Data", value=date(year, month, 1))
+            d = st.date_input("Data", value=date(year, month, 1), format="DD/MM/YYYY")
             amount = st.number_input("Importo", min_value=0.0, step=10.0)
             category = st.selectbox("Categoria", ["Buoni", "Alloggio", "Auto", "Telefono", "Pasto", "Altro"])
             note = st.text_input("Nota")
-            save = st.form_submit_button("Registra", type="primary")
+            save = st.form_submit_button("Registra altro costo", type="primary")
         if save:
             sb.table("fringe_benefits").insert({
                 "employee_id": employee_id, "benefit_date": d.isoformat(),
@@ -4723,14 +5030,19 @@ elif section == "Fringe benefit":
             st.success("Fringe registrato.")
 
 elif section == "Extra da regolarizzare":
-    st.title("Extra da regolarizzare")
-    st.warning("Registro interno. Gli importi devono essere comunicati e regolarizzati con il consulente.")
+    st.title("Altri costi da regolarizzare")
+    st.warning(
+        "Registro interno. Gli importi devono essere comunicati e "
+        "regolarizzati con il consulente. Ogni importo viene sommato, "
+        "come «Altro costo», al costo aziendale importato del dipendente "
+        "nel mese della data selezionata."
+    )
     employees = employees_df()
     if not employees.empty:
         with st.form("extra"):
             name = st.selectbox("Dipendente", employees["name"].tolist())
             employee_id = int(employees.loc[employees["name"] == name, "id"].iloc[0])
-            d = st.date_input("Data", value=date(year, month, 1))
+            d = st.date_input("Data", value=date(year, month, 1), format="DD/MM/YYYY")
             amount = st.number_input("Importo", min_value=0.0, step=10.0)
             reason = st.text_input("Motivo")
             note = st.text_area("Nota")
@@ -4759,7 +5071,40 @@ elif section == "Extra da regolarizzare":
                 details={"amount": amount, "reason": reason},
                 severity="warning",
             )
-            st.success("Extra registrato.")
+            selected_year = d.year
+            selected_month = d.month
+            start_extra, end_extra = month_bounds(selected_year, selected_month)
+            monthly_extras = (
+                sb.table("extra_payments")
+                .select("amount")
+                .eq("employee_id", employee_id)
+                .gte("payment_date", start_extra.isoformat())
+                .lt("payment_date", end_extra.isoformat())
+                .execute().data or []
+            )
+            total_other_cost = sum(
+                float(row.get("amount") or 0)
+                for row in monthly_extras
+            )
+            imported_cost_rows = (
+                sb.table("monthly_costs")
+                .select("company_cost")
+                .eq("employee_id", employee_id)
+                .eq("year", selected_year)
+                .eq("month", selected_month)
+                .limit(1)
+                .execute().data or []
+            )
+            imported_cost = (
+                float(imported_cost_rows[0].get("company_cost") or 0)
+                if imported_cost_rows else 0
+            )
+            st.success(
+                f"Altro costo registrato. Totale altri costi di "
+                f"{MONTHS[selected_month]} {selected_year}: "
+                f"{euro(total_other_cost)}. Costo complessivo del "
+                f"dipendente: {euro(imported_cost + total_other_cost)}."
+            )
 
 elif section == "Dati del mese":
     st.title("Dati del mese")

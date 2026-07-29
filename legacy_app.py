@@ -2875,13 +2875,182 @@ def rls_diagnostic_snapshot():
 
     return results
 
+
+def system_health_snapshot():
+    checks = []
+
+    def add_check(name, ok, detail, category):
+        checks.append({
+            "Controllo": name,
+            "Stato": "OPERATIVO" if ok else "DA VERIFICARE",
+            "Dettaglio": detail,
+            "Categoria": category,
+        })
+
+    # 1. Connessione database.
+    try:
+        sb.table("employee_accounts").select("id", count="exact").limit(1).execute()
+        add_check(
+            "Connessione al database",
+            True,
+            "Supabase risponde correttamente.",
+            "Database",
+        )
+    except Exception as exc:
+        add_check(
+            "Connessione al database",
+            False,
+            f"Connessione non riuscita: {str(exc)[:120]}",
+            "Database",
+        )
+
+    # 2. Tabelle fondamentali.
+    required_tables = [
+        "employee_accounts",
+        "timesheets",
+        "clock_entries",
+        "payslips",
+        "employee_documents",
+        "employee_notifications",
+    ]
+    missing_tables = []
+    for table_name in required_tables:
+        try:
+            sb.table(table_name).select("*").limit(1).execute()
+        except Exception:
+            missing_tables.append(table_name)
+
+    add_check(
+        "Struttura dati principale",
+        len(missing_tables) == 0,
+        (
+            "Tutte le tabelle fondamentali sono raggiungibili."
+            if not missing_tables
+            else "Non raggiungibili: " + ", ".join(missing_tables)
+        ),
+        "Database",
+    )
+
+    # 3. RLS e policy.
+    rls_rows = rls_diagnostic_snapshot()
+    rls_ok = bool(rls_rows) and all(
+        row.get("RLS") == "ATTIVA" and int(row.get("Policy") or 0) > 0
+        for row in rls_rows
+    )
+    add_check(
+        "Protezione dei dati utenti",
+        rls_ok,
+        (
+            "RLS attiva e almeno una policy presente su tutte le tabelle controllate."
+            if rls_ok
+            else "Una o più tabelle non risultano completamente protette."
+        ),
+        "Sicurezza",
+    )
+
+    # 4. Storage.
+    try:
+        bucket_response = sb.storage.list_buckets()
+        bucket_names = {
+            getattr(bucket, "name", None)
+            if not isinstance(bucket, dict)
+            else bucket.get("name")
+            for bucket in (bucket_response or [])
+        }
+        bucket_names.discard(None)
+        expected = {"payslips", "employee-documents"}
+        missing_buckets = sorted(expected - bucket_names)
+        add_check(
+            "Archivio documenti",
+            not missing_buckets,
+            (
+                "Bucket documenti e buste paga disponibili."
+                if not missing_buckets
+                else "Bucket mancanti: " + ", ".join(missing_buckets)
+            ),
+            "Archiviazione",
+        )
+    except Exception as exc:
+        add_check(
+            "Archivio documenti",
+            False,
+            f"Verifica Storage non riuscita: {str(exc)[:120]}",
+            "Archiviazione",
+        )
+
+    # 5. Ambiente.
+    env_info = runtime_environment_snapshot()
+    env_ok = env_info["environment"] in {"production", "staging"}
+    add_check(
+        "Configurazione ambiente",
+        env_ok,
+        (
+            f"Ambiente configurato come {env_info['environment'].upper()}."
+            if env_ok
+            else "Valore ambiente non riconosciuto."
+        ),
+        "Configurazione",
+    )
+
+    # 6. Ultimo backup registrato.
+    try:
+        backup_rows = (
+            sb.table("system_events")
+            .select("created_at,title")
+            .eq("event_type", "backup_exported")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute().data or []
+        )
+        if backup_rows:
+            backup_date = format_datetime_it(backup_rows[0].get("created_at"))
+            add_check(
+                "Backup applicativo",
+                True,
+                f"Ultimo backup registrato: {backup_date}.",
+                "Continuità operativa",
+            )
+        else:
+            add_check(
+                "Backup applicativo",
+                False,
+                "Nessun backup registrato nel Registro eventi.",
+                "Continuità operativa",
+            )
+    except Exception:
+        add_check(
+            "Backup applicativo",
+            False,
+            "Impossibile verificare l'ultimo backup.",
+            "Continuità operativa",
+        )
+
+    # 7. Versione.
+    try:
+        from rv_manager import __version__
+        version_text = __version__
+    except Exception:
+        version_text = "3.8.0"
+
+    add_check(
+        "Versione software",
+        True,
+        f"RV Manager Enterprise {version_text}.",
+        "Applicazione",
+    )
+
+    return checks
+
+def health_status_icon(status):
+    return "🟢" if status == "OPERATIVO" else "🟡"
+
 st.sidebar.markdown(
     """
     <div class="rv-brand">
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.7 · Usabilità e costi</div>
+            <div class="rv-brand-subtitle">Enterprise 3.8 · Stato del sistema</div>
         </div>
     </div>
     """,
@@ -2902,7 +3071,7 @@ MENU_ICONS = {
     "Centro documenti": "□",
     "Centro notifiche": "●",
     "Sicurezza e collaudo": "⚿",
-    "Ambiente e RLS": "◈",
+    "Stato del sistema": "◈",
     "Fringe benefit": "◆",
     "Extra da regolarizzare": "△",
     "Dati del mese": "▦",
@@ -2922,7 +3091,7 @@ MENU_ITEMS = [
     "Centro documenti",
     "Centro notifiche",
     "Sicurezza e collaudo",
-    "Ambiente e RLS",
+    "Stato del sistema",
     "Fringe benefit",
     "Extra da regolarizzare",
     "Dati del mese",
@@ -4932,67 +5101,114 @@ elif section == "Sicurezza e collaudo":
 
 
 
-elif section == "Ambiente e RLS":
-    st.title("Ambiente e sicurezza RLS")
+
+elif section == "Stato del sistema":
+    st.title("Stato del sistema")
     st.caption(
-        "Verifica separazione tra produzione e staging e stato delle policy "
-        "sulle tabelle sensibili."
+        "Controllo rapido dell'affidabilità, della sicurezza e dei servizi "
+        "principali di RV Manager."
     )
 
     env_info = runtime_environment_snapshot()
 
-    e1, e2, e3 = st.columns(3)
-    e1.metric("Ambiente", env_info["environment"].upper())
-    e2.metric("Progetto", env_info["project_label"])
-    e3.metric(
-        "Dati reali consentiti",
-        "Sì" if env_info["allow_real_data"] else "No",
-    )
-
     if env_info["is_staging"]:
-        st.warning(
-            "Stai lavorando in STAGING. Usa esclusivamente dati fittizi o "
-            "anonimizzati."
-        )
+        st.warning("Ambiente STAGING: utilizzare solo dati fittizi o anonimizzati.")
     elif env_info["is_production"]:
         st.error(
-            "Stai lavorando in PRODUZIONE. Evita prove distruttive e carica "
-            "solo modifiche già collaudate."
+            "Ambiente PRODUZIONE: evitare prove distruttive e installare "
+            "solo aggiornamenti già collaudati."
         )
     else:
-        st.info("Ambiente personalizzato rilevato.")
+        st.info(f"Ambiente rilevato: {env_info['environment'].upper()}")
 
-    st.subheader("Diagnostica RLS")
-    rls_rows = rls_diagnostic_snapshot()
+    if st.button(
+        "Esegui controllo completo del sistema",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["ultimo_controllo_sistema"] = {
+            "data": format_datetime_it(datetime.now(UTC_TZ).isoformat()),
+            "risultati": system_health_snapshot(),
+        }
+
+    if "ultimo_controllo_sistema" not in st.session_state:
+        st.session_state["ultimo_controllo_sistema"] = {
+            "data": format_datetime_it(datetime.now(UTC_TZ).isoformat()),
+            "risultati": system_health_snapshot(),
+        }
+
+    health_data = st.session_state["ultimo_controllo_sistema"]
+    health_rows = health_data["risultati"]
+
+    operational = sum(
+        1 for row in health_rows if row["Stato"] == "OPERATIVO"
+    )
+    total_checks = len(health_rows)
+    pending = total_checks - operational
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Controlli superati", f"{operational}/{total_checks}")
+    c2.metric("Da verificare", pending)
+    c3.metric("Ambiente", env_info["environment"].upper())
+    c4.metric("Ultimo controllo", health_data["data"])
+
+    if pending == 0:
+        st.success(
+            "Il sistema risulta operativo nei controlli automatici eseguiti."
+        )
+    else:
+        st.warning(
+            f"{pending} controllo/i richiedono attenzione. "
+            "Apri i dettagli qui sotto."
+        )
+
+    st.subheader("Riepilogo")
+    for row in health_rows:
+        with st.container(border=True):
+            left, right = st.columns([1, 5])
+            left.markdown(
+                f"### {health_status_icon(row['Stato'])}"
+            )
+            right.markdown(f"**{row['Controllo']}**")
+            right.caption(row["Dettaglio"])
+
+    st.subheader("Dettaglio tecnico")
+    technical_df = pd.DataFrame(health_rows)[
+        ["Categoria", "Controllo", "Stato", "Dettaglio"]
+    ]
     st.dataframe(
-        pd.DataFrame(rls_rows),
+        technical_df,
         use_container_width=True,
         hide_index=True,
     )
 
-    if any(row["RLS"] != "ATTIVA" for row in rls_rows):
-        st.warning(
-            "La diagnostica RLS non è completa oppure alcune tabelle non "
-            "risultano verificate. Esegui la migrazione diagnostica 3.6."
+    with st.expander("Protezione delle tabelle"):
+        rls_rows = rls_diagnostic_snapshot()
+        st.dataframe(
+            pd.DataFrame(rls_rows),
+            use_container_width=True,
+            hide_index=True,
         )
-    else:
-        st.success("Le tabelle sensibili risultano con RLS attiva.")
+        st.caption(
+            "RLS impedisce agli utenti non autorizzati di accedere ai dati "
+            "di altri dipendenti. Le policy stabiliscono quali operazioni "
+            "sono consentite."
+        )
 
-    st.subheader("Test manuale obbligatorio")
-    st.markdown(
-        """
-        1. Accedi con un dipendente A e annota i suoi documenti.
-        2. Accedi con un dipendente B.
-        3. Verifica che B non veda documenti, buste paga, ore o notifiche di A.
-        4. Ripeti il test invertendo gli account.
-        5. Esegui lo stesso controllo nell'ambiente staging prima di ogni rilascio.
-        """
-    )
-
-    st.info(
-        "Il pannello diagnostico non sostituisce i test reali con account "
-        "differenti."
-    )
+    with st.expander("Verifica manuale tra utenti"):
+        st.markdown(
+            """
+            1. Accedi con il dipendente A e annota documenti, ore e buste paga.
+            2. Esci e accedi con il dipendente B.
+            3. Verifica che B non possa vedere i dati di A.
+            4. Ripeti il controllo invertendo i due account.
+            5. Esegui questo test in staging prima di ogni rilascio.
+            """
+        )
+        st.warning(
+            "Il controllo automatico verifica configurazione e servizi, "
+            "ma non sostituisce il test reale con due account distinti."
+        )
 
 
 elif section == "Fringe benefit":

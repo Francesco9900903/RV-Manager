@@ -1,0 +1,8 @@
+{
+  "version": "4.2.0",
+  "feature": "Simulatore busta paga CCNL Turismo Confcommercio",
+  "hidden_github_folder_included": false,
+  "requires_sql_for_saving": true,
+  "migration": "sql/MIGRAZIONE_ENTERPRISE_4_2_SIMULAZIONI_BUSTA_PAGA.sql",
+  "calculations_are_estimates": true
+}

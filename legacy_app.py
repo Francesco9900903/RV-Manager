@@ -2788,7 +2788,7 @@ def export_backup_manifest():
     manifest = {
         "generated_at": now_rome().isoformat(),
         "application": "RV Manager Enterprise",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "tables": {},
     }
 
@@ -2977,6 +2977,174 @@ def backup_size_label(size_bytes):
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
 
+
+
+# Tabelle minime in vigore da maggio 2026 per il CCNL Turismo
+# Confcommercio - aziende alberghiere.
+CCNL_TURISMO_2026 = {
+    "Alberghi": {
+        "Quadro A": 2491.82, "Quadro B": 2307.53, "1": 2084.71,
+        "2": 1905.40, "3": 1797.04, "4": 1695.69, "5": 1590.27,
+        "6S": 1529.13, "6": 1507.45, "7": 1412.60,
+    },
+    "Alberghi minori": {
+        "Quadro A": 2480.46, "Quadro B": 2297.20, "1": 2074.38,
+        "2": 1896.62, "3": 1789.29, "4": 1688.98, "5": 1584.07,
+        "6S": 1523.45, "6": 1501.77, "7": 1407.44,
+    },
+}
+
+MANSIONI_TURISMO = [
+    "Addetto/a ricevimento", "Cameriere/a di sala", "Barista", "Cuoco/a",
+    "Aiuto cuoco/a", "Cameriere/a ai piani", "Addetto/a pulizie",
+    "Manutentore/trice", "Responsabile di reparto", "Direttore/trice", "Altro",
+]
+
+def euro_it(value):
+    value = float(value or 0)
+    formatted = f"{value:,.2f}"
+    return "€ " + formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+
+def progressive_irpef_annual(taxable):
+    taxable = max(float(taxable or 0), 0.0)
+    first = min(taxable, 28000.0) * 0.23
+    second = min(max(taxable - 28000.0, 0.0), 22000.0) * 0.35
+    third = max(taxable - 50000.0, 0.0) * 0.43
+    return first + second + third
+
+def employee_tax_credit_annual(income):
+    income = max(float(income or 0), 0.0)
+    if income <= 15000:
+        return max(1955.0, 1910.0 + 1190.0 * (15000.0 - income) / 15000.0)
+    if income <= 50000:
+        return 1910.0 * (50000.0 - income) / 35000.0
+    return 0.0
+
+def simulate_payroll(inputs):
+    monthly_divisor = float(inputs.get("monthly_divisor") or 172.0)
+    contractual_monthly = float(inputs.get("contractual_monthly") or 0.0)
+    ordinary_hours = float(inputs.get("ordinary_hours") or 0.0)
+    hourly_rate = contractual_monthly / monthly_divisor
+
+    ordinary_pay = hourly_rate * ordinary_hours
+    overtime_pay = hourly_rate * float(inputs.get("overtime_hours") or 0.0) * (
+        1 + float(inputs.get("overtime_markup") or 0.0) / 100
+    )
+    night_pay = hourly_rate * float(inputs.get("night_hours") or 0.0) * (
+        float(inputs.get("night_markup") or 0.0) / 100
+    )
+    holiday_pay = hourly_rate * float(inputs.get("holiday_hours") or 0.0) * (
+        float(inputs.get("holiday_markup") or 0.0) / 100
+    )
+    sunday_pay = hourly_rate * float(inputs.get("sunday_hours") or 0.0) * (
+        float(inputs.get("sunday_markup") or 0.0) / 100
+    )
+
+    gross_month = (
+        ordinary_pay + overtime_pay + night_pay + holiday_pay + sunday_pay
+        + float(inputs.get("superminimo") or 0.0)
+        + float(inputs.get("bonuses") or 0.0)
+        + float(inputs.get("allowances") or 0.0)
+    )
+
+    employee_rate = float(inputs.get("employee_contribution_rate") or 0.0) / 100
+    employee_contributions = gross_month * employee_rate
+    annual_taxable = max(gross_month - employee_contributions, 0.0) * 14
+    gross_irpef_annual = progressive_irpef_annual(annual_taxable)
+    tax_credit_annual = employee_tax_credit_annual(annual_taxable)
+    irpef_month = max(gross_irpef_annual - tax_credit_annual, 0.0) / 14
+    additions_month = annual_taxable * (
+        float(inputs.get("additional_tax_rate") or 0.0) / 100
+    ) / 14
+    net_month = gross_month - employee_contributions - irpef_month - additions_month
+
+    employer_contributions = gross_month * (
+        float(inputs.get("employer_contribution_rate") or 0.0) / 100
+    )
+    inail = gross_month * (float(inputs.get("inail_rate") or 0.0) / 100)
+    thirteenth = gross_month / 12
+    fourteenth = gross_month / 12
+    tfr = gross_month / 13.5
+    leave_accrual = gross_month * (
+        float(inputs.get("leave_accrual_rate") or 0.0) / 100
+    )
+    company_cost = (
+        gross_month + employer_contributions + inail + thirteenth
+        + fourteenth + tfr + leave_accrual
+    )
+
+    return {
+        "hourly_rate": hourly_rate,
+        "ordinary_pay": ordinary_pay,
+        "overtime_pay": overtime_pay,
+        "night_pay": night_pay,
+        "holiday_pay": holiday_pay,
+        "sunday_pay": sunday_pay,
+        "gross_month": gross_month,
+        "employee_contributions": employee_contributions,
+        "annual_taxable": annual_taxable,
+        "gross_irpef_annual": gross_irpef_annual,
+        "tax_credit_annual": tax_credit_annual,
+        "irpef_month": irpef_month,
+        "additions_month": additions_month,
+        "net_month": max(net_month, 0.0),
+        "employer_contributions": employer_contributions,
+        "inail": inail,
+        "thirteenth": thirteenth,
+        "fourteenth": fourteenth,
+        "tfr": tfr,
+        "leave_accrual": leave_accrual,
+        "company_cost": company_cost,
+        "annual_company_cost": company_cost * 12,
+    }
+
+def payroll_report_html(inputs, result):
+    rows = [
+        ("Mansione", inputs.get("job_title", "")),
+        ("Livello", inputs.get("level", "")),
+        ("Comparto", inputs.get("sector", "")),
+        ("Ore ordinarie", f"{inputs.get('ordinary_hours', 0):.2f}"),
+        ("Minimo mensile utilizzato", euro_it(inputs.get("contractual_monthly", 0))),
+        ("Lordo mensile stimato", euro_it(result["gross_month"])),
+        ("Netto mensile stimato", euro_it(result["net_month"])),
+        ("Costo mensile azienda", euro_it(result["company_cost"])),
+        ("Costo annuo azienda", euro_it(result["annual_company_cost"])),
+    ]
+    body = "".join(
+        f"<tr><th>{label}</th><td>{value}</td></tr>"
+        for label, value in rows
+    )
+    return f"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><title>Simulazione busta paga</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:40px;color:#172033}}
+h1{{margin-bottom:4px}} small{{color:#667085}}
+table{{border-collapse:collapse;width:100%;margin-top:24px}}
+th,td{{border:1px solid #dfe5ed;padding:12px;text-align:left}}
+th{{width:45%;background:#f4f6f9}}
+.notice{{margin-top:24px;padding:14px;background:#fff7e6;border:1px solid #f0d49a}}
+</style></head><body><h1>RV Manager Enterprise</h1>
+<small>Simulazione economica CCNL Turismo Confcommercio</small>
+<table>{body}</table>
+<div class="notice"><strong>Avvertenza:</strong> elaborazione indicativa.
+Non sostituisce il cedolino o il conteggio del consulente del lavoro.</div>
+</body></html>"""
+
+def save_payroll_simulation(inputs, result):
+    payload = {
+        "job_title": inputs.get("job_title"),
+        "ccnl": "CCNL Turismo Confcommercio - aziende alberghiere",
+        "sector": inputs.get("sector"),
+        "level": inputs.get("level"),
+        "monthly_hours": float(inputs.get("ordinary_hours") or 0),
+        "gross_monthly": round(result.get("gross_month", 0), 2),
+        "net_monthly": round(result.get("net_month", 0), 2),
+        "company_cost_monthly": round(result.get("company_cost", 0), 2),
+        "parameters": inputs,
+        "result": result,
+        "created_at": now_rome().isoformat(),
+    }
+    return sb.table("payroll_simulations").insert(payload).execute()
 
 def runtime_environment_snapshot():
     try:
@@ -3236,7 +3404,7 @@ def system_health_snapshot():
         from rv_manager import __version__
         version_text = __version__
     except Exception:
-        version_text = "4.1.0"
+        version_text = "4.2.0"
 
     add_check(
         "Versione software",
@@ -3256,7 +3424,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 4.1 · Backup integrato</div>
+            <div class="rv-brand-subtitle">Enterprise 4.2 · Simulatore busta paga</div>
         </div>
     </div>
     """,
@@ -3274,6 +3442,7 @@ MENU_ICONS = {
     "Ore e approvazioni": "◷",
     "Accessi dipendenti": "◇",
     "Buste paga": "▤",
+    "Simulazione busta paga": "€",
     "Centro documenti": "□",
     "Centro notifiche": "●",
     "Sicurezza e collaudo": "⚿",
@@ -3294,6 +3463,7 @@ MENU_ITEMS = [
     "Ore e approvazioni",
     "Accessi dipendenti",
     "Buste paga",
+    "Simulazione busta paga",
     "Centro documenti",
     "Centro notifiche",
     "Sicurezza e collaudo",
@@ -5306,6 +5476,258 @@ elif section == "Sicurezza e collaudo":
         )
 
 
+
+
+
+elif section == "Simulazione busta paga":
+    st.title("Simulazione busta paga")
+    st.caption(
+        "Stima del netto mensile e del costo aziendale per il CCNL Turismo "
+        "Confcommercio – aziende alberghiere."
+    )
+    st.warning(
+        "Il risultato è indicativo e non sostituisce l'elaborazione del "
+        "consulente del lavoro. Aliquote, agevolazioni, addizionali e "
+        "inquadramento devono essere verificati prima dell'assunzione."
+    )
+
+    with st.form("simulatore_busta_paga"):
+        st.subheader("Rapporto di lavoro")
+        r1, r2, r3 = st.columns(3)
+        sector = r1.selectbox("Comparto", list(CCNL_TURISMO_2026.keys()))
+        level = r2.selectbox("Livello", list(CCNL_TURISMO_2026[sector].keys()))
+        contract_type = r3.selectbox(
+            "Tipo di contratto",
+            ["Tempo indeterminato", "Tempo determinato", "Apprendistato"],
+        )
+
+        m1, m2, m3 = st.columns(3)
+        job_title_choice = m1.selectbox("Mansione", MANSIONI_TURISMO)
+        custom_job = m2.text_input(
+            "Mansione personalizzata",
+            disabled=job_title_choice != "Altro",
+        )
+        weekly_hours = m3.number_input(
+            "Ore settimanali contrattuali", 1.0, 40.0, 40.0, 1.0
+        )
+        job_title = (
+            custom_job.strip()
+            if job_title_choice == "Altro"
+            else job_title_choice
+        )
+
+        st.subheader("Lavoro svolto nel mese")
+        h1, h2, h3 = st.columns(3)
+        ordinary_hours = h1.number_input(
+            "Ore ordinarie", 0.0, 300.0, 172.0, 1.0
+        )
+        overtime_hours = h2.number_input(
+            "Ore straordinarie", 0.0, 150.0, 0.0, 0.5
+        )
+        night_hours = h3.number_input(
+            "Ore notturne", 0.0, 200.0, 0.0, 0.5
+        )
+        h4, h5, h6 = st.columns(3)
+        holiday_hours = h4.number_input(
+            "Ore festive", 0.0, 150.0, 0.0, 0.5
+        )
+        sunday_hours = h5.number_input(
+            "Ore domenicali", 0.0, 150.0, 0.0, 0.5
+        )
+        monthly_divisor = h6.number_input(
+            "Divisore orario", 1.0, 300.0, 172.0, 1.0
+        )
+
+        st.subheader("Elementi economici")
+        default_minimum = CCNL_TURISMO_2026[sector][level]
+        e1, e2, e3, e4 = st.columns(4)
+        contractual_monthly = e1.number_input(
+            "Minimo mensile CCNL",
+            0.0, 10000.0, float(default_minimum), 1.0,
+            help="Valore precaricato della tabella maggio 2026, modificabile.",
+        )
+        superminimo = e2.number_input(
+            "Superminimo mensile", 0.0, 10000.0, 0.0, 10.0
+        )
+        bonuses = e3.number_input(
+            "Premi nel mese", 0.0, 20000.0, 0.0, 10.0
+        )
+        allowances = e4.number_input(
+            "Indennità nel mese", 0.0, 20000.0, 0.0, 10.0
+        )
+
+        with st.expander("Maggiorazioni e parametri di stima"):
+            p1, p2, p3, p4 = st.columns(4)
+            overtime_markup = p1.number_input(
+                "Straordinario %", 0.0, 200.0, 15.0, 1.0
+            )
+            night_markup = p2.number_input(
+                "Notturno %", 0.0, 200.0, 25.0, 1.0
+            )
+            holiday_markup = p3.number_input(
+                "Festivo %", 0.0, 200.0, 30.0, 1.0
+            )
+            sunday_markup = p4.number_input(
+                "Domenicale %", 0.0, 200.0, 10.0, 1.0
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+            employee_contribution_rate = c1.number_input(
+                "Contributi dipendente %", 0.0, 30.0, 9.19, 0.01
+            )
+            employer_contribution_rate = c2.number_input(
+                "Contributi azienda %", 0.0, 60.0, 30.00, 0.10
+            )
+            inail_rate = c3.number_input(
+                "INAIL stimata %", 0.0, 20.0, 1.00, 0.10
+            )
+            additional_tax_rate = c4.number_input(
+                "Addizionali stimate %", 0.0, 10.0, 2.00, 0.10
+            )
+            leave_accrual_rate = st.number_input(
+                "Ferie e permessi – accantonamento %",
+                0.0, 30.0, 8.00, 0.10,
+            )
+
+        calculate = st.form_submit_button(
+            "Calcola simulazione",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if calculate:
+        inputs = {
+            "sector": sector,
+            "level": level,
+            "contract_type": contract_type,
+            "job_title": job_title,
+            "weekly_hours": weekly_hours,
+            "ordinary_hours": ordinary_hours,
+            "overtime_hours": overtime_hours,
+            "night_hours": night_hours,
+            "holiday_hours": holiday_hours,
+            "sunday_hours": sunday_hours,
+            "monthly_divisor": monthly_divisor,
+            "contractual_monthly": contractual_monthly,
+            "superminimo": superminimo,
+            "bonuses": bonuses,
+            "allowances": allowances,
+            "overtime_markup": overtime_markup,
+            "night_markup": night_markup,
+            "holiday_markup": holiday_markup,
+            "sunday_markup": sunday_markup,
+            "employee_contribution_rate": employee_contribution_rate,
+            "employer_contribution_rate": employer_contribution_rate,
+            "inail_rate": inail_rate,
+            "additional_tax_rate": additional_tax_rate,
+            "leave_accrual_rate": leave_accrual_rate,
+        }
+        result = simulate_payroll(inputs)
+        st.session_state["ultima_simulazione_busta"] = {
+            "inputs": inputs,
+            "result": result,
+        }
+
+    simulation = st.session_state.get("ultima_simulazione_busta")
+    if simulation:
+        inputs = simulation["inputs"]
+        result = simulation["result"]
+
+        st.divider()
+        st.subheader("Risultato della simulazione")
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Lordo mensile", euro_it(result["gross_month"]))
+        n2.metric("Netto stimato", euro_it(result["net_month"]))
+        n3.metric("Costo azienda", euro_it(result["company_cost"]))
+        n4.metric("Costo annuo stimato", euro_it(result["annual_company_cost"]))
+
+        tab_employee, tab_company, tab_details = st.tabs(
+            ["Dipendente", "Azienda", "Dettaglio calcolo"]
+        )
+        with tab_employee:
+            employee_rows = [
+                {"Voce": "Retribuzione lorda", "Importo": euro_it(result["gross_month"])},
+                {"Voce": "Contributi dipendente", "Importo": euro_it(result["employee_contributions"])},
+                {"Voce": "IRPEF mensile stimata", "Importo": euro_it(result["irpef_month"])},
+                {"Voce": "Addizionali stimate", "Importo": euro_it(result["additions_month"])},
+                {"Voce": "Netto mensile stimato", "Importo": euro_it(result["net_month"])},
+            ]
+            st.dataframe(
+                pd.DataFrame(employee_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_company:
+            company_rows = [
+                {"Voce": "Retribuzione lorda", "Importo": euro_it(result["gross_month"])},
+                {"Voce": "Contributi azienda", "Importo": euro_it(result["employer_contributions"])},
+                {"Voce": "INAIL stimata", "Importo": euro_it(result["inail"])},
+                {"Voce": "Rateo tredicesima", "Importo": euro_it(result["thirteenth"])},
+                {"Voce": "Rateo quattordicesima", "Importo": euro_it(result["fourteenth"])},
+                {"Voce": "TFR maturato", "Importo": euro_it(result["tfr"])},
+                {"Voce": "Ferie e permessi", "Importo": euro_it(result["leave_accrual"])},
+                {"Voce": "Costo complessivo mensile", "Importo": euro_it(result["company_cost"])},
+            ]
+            st.dataframe(
+                pd.DataFrame(company_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with tab_details:
+            detail_rows = [
+                {"Voce": "Paga oraria", "Importo": euro_it(result["hourly_rate"])},
+                {"Voce": "Ore ordinarie", "Importo": euro_it(result["ordinary_pay"])},
+                {"Voce": "Straordinari", "Importo": euro_it(result["overtime_pay"])},
+                {"Voce": "Maggiorazione notturna", "Importo": euro_it(result["night_pay"])},
+                {"Voce": "Maggiorazione festiva", "Importo": euro_it(result["holiday_pay"])},
+                {"Voce": "Maggiorazione domenicale", "Importo": euro_it(result["sunday_pay"])},
+                {"Voce": "Imponibile fiscale annuo stimato", "Importo": euro_it(result["annual_taxable"])},
+                {"Voce": "Detrazione lavoro annua stimata", "Importo": euro_it(result["tax_credit_annual"])},
+            ]
+            st.dataframe(
+                pd.DataFrame(detail_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        report_html = payroll_report_html(inputs, result)
+        a1, a2 = st.columns(2)
+        a1.download_button(
+            "Scarica preventivo stampabile",
+            data=report_html.encode("utf-8"),
+            file_name=(
+                "simulazione_"
+                + inputs.get("job_title", "dipendente").replace(" ", "_")
+                + ".html"
+            ),
+            mime="text/html",
+            use_container_width=True,
+        )
+        if a2.button("Salva simulazione", use_container_width=True):
+            try:
+                save_payroll_simulation(inputs, result)
+                audit(
+                    "payroll_simulation_saved",
+                    "Simulazione busta paga salvata",
+                    entity_type="payroll_simulation",
+                    details={
+                        "job_title": inputs.get("job_title"),
+                        "level": inputs.get("level"),
+                        "gross": result.get("gross_month"),
+                        "net": result.get("net_month"),
+                        "company_cost": result.get("company_cost"),
+                    },
+                )
+                st.success("Simulazione salvata.")
+            except Exception as exc:
+                st.error(
+                    "Simulazione non salvata. "
+                    "Esegui la migrazione Enterprise 4.2."
+                )
+                with st.expander("Dettaglio tecnico"):
+                    st.code(technical_error_text(exc))
 
 
 elif section == "Stato del sistema":

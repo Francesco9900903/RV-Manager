@@ -2876,32 +2876,79 @@ def rls_diagnostic_snapshot():
     return results
 
 
+
+def safe_system_message(error):
+    text = str(error or "").strip()
+    if not text:
+        return "Dettaglio tecnico non disponibile."
+    lowered = text.lower()
+
+    if "does not exist" in lowered or "42703" in lowered:
+        return "Il controllo usa una struttura dati non compatibile con questa installazione."
+    if "permission" in lowered or "unauthorized" in lowered or "401" in lowered:
+        return "Permessi insufficienti per completare il controllo."
+    if "timeout" in lowered:
+        return "Il servizio ha impiegato troppo tempo a rispondere."
+    if "connection" in lowered or "network" in lowered:
+        return "Connessione temporaneamente non disponibile."
+    return "Il controllo non è stato completato. Apri i dettagli tecnici per maggiori informazioni."
+
+def technical_error_text(error):
+    text = str(error or "").strip()
+    return text[:500] if text else "Nessun dettaglio disponibile."
+
 def system_health_snapshot():
     checks = []
 
-    def add_check(name, ok, detail, category):
+    def add_check(name, ok, detail, category, technical_detail=""):
         checks.append({
             "Controllo": name,
             "Stato": "OPERATIVO" if ok else "DA VERIFICARE",
             "Dettaglio": detail,
             "Categoria": category,
+            "Dettaglio tecnico": technical_detail,
         })
 
     # 1. Connessione database.
     try:
-        sb.table("employee_accounts").select("id", count="exact").limit(1).execute()
+        import time
+        started_at = time.perf_counter()
+        sb.table("employee_accounts").select("*", count="exact").limit(1).execute()
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        performance_ok = elapsed_ms < 3000
+
         add_check(
             "Connessione al database",
             True,
             "Supabase risponde correttamente.",
             "Database",
+            f"Tempo di risposta: {elapsed_ms} ms.",
+        )
+        add_check(
+            "Prestazioni database",
+            performance_ok,
+            (
+                "Tempo di risposta regolare."
+                if performance_ok
+                else "Il database risponde, ma con tempi superiori alla soglia consigliata."
+            ),
+            "Prestazioni",
+            f"Tempo di risposta misurato: {elapsed_ms} ms. Soglia: 3000 ms.",
         )
     except Exception as exc:
         add_check(
             "Connessione al database",
             False,
-            f"Connessione non riuscita: {str(exc)[:120]}",
+            safe_system_message(exc),
             "Database",
+            technical_error_text(exc),
+        )
+        add_check(
+            "Prestazioni database",
+            False,
+            "Prestazioni non misurabili perché la connessione non è stata completata.",
+            "Prestazioni",
+            technical_error_text(exc),
         )
 
     # 2. Tabelle fondamentali.
@@ -2974,8 +3021,9 @@ def system_health_snapshot():
         add_check(
             "Archivio documenti",
             False,
-            f"Verifica Storage non riuscita: {str(exc)[:120]}",
+            safe_system_message(exc),
             "Archiviazione",
+            technical_error_text(exc),
         )
 
     # 5. Ambiente.
@@ -3021,8 +3069,9 @@ def system_health_snapshot():
         add_check(
             "Backup applicativo",
             False,
-            "Impossibile verificare l'ultimo backup.",
+            "Il controllo backup non è ancora configurato per questa installazione.",
             "Continuità operativa",
+            "La tabella o l'evento di backup non sono disponibili oppure non sono leggibili.",
         )
 
     # 7. Versione.
@@ -3030,7 +3079,7 @@ def system_health_snapshot():
         from rv_manager import __version__
         version_text = __version__
     except Exception:
-        version_text = "3.8.0"
+        version_text = "4.0.0"
 
     add_check(
         "Versione software",
@@ -3050,7 +3099,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 3.8 · Stato del sistema</div>
+            <div class="rv-brand-subtitle">Enterprise 4.0 · Affidabilità</div>
         </div>
     </div>
     """,
@@ -5105,7 +5154,7 @@ elif section == "Sicurezza e collaudo":
 elif section == "Stato del sistema":
     st.title("Stato del sistema")
     st.caption(
-        "Controllo rapido dell'affidabilità, della sicurezza e dei servizi "
+        "Controllo automatico dell'affidabilità, della sicurezza e dei servizi "
         "principali di RV Manager."
     )
 
@@ -5166,21 +5215,23 @@ elif section == "Stato del sistema":
     for row in health_rows:
         with st.container(border=True):
             left, right = st.columns([1, 5])
-            left.markdown(
-                f"### {health_status_icon(row['Stato'])}"
-            )
+            left.markdown(f"### {health_status_icon(row['Stato'])}")
             right.markdown(f"**{row['Controllo']}**")
             right.caption(row["Dettaglio"])
 
-    st.subheader("Dettaglio tecnico")
-    technical_df = pd.DataFrame(health_rows)[
-        ["Categoria", "Controllo", "Stato", "Dettaglio"]
-    ]
-    st.dataframe(
-        technical_df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    with st.expander("Dettagli tecnici per amministratori"):
+        technical_df = pd.DataFrame(health_rows)[
+            ["Categoria", "Controllo", "Stato", "Dettaglio tecnico"]
+        ]
+        st.dataframe(
+            technical_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Questa sezione è destinata all'amministratore tecnico e può "
+            "contenere informazioni utili per l'assistenza."
+        )
 
     with st.expander("Protezione delle tabelle"):
         rls_rows = rls_diagnostic_snapshot()

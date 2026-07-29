@@ -2788,7 +2788,7 @@ def export_backup_manifest():
     manifest = {
         "generated_at": now_rome().isoformat(),
         "application": "RV Manager Enterprise",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "tables": {},
     }
 
@@ -2982,7 +2982,7 @@ def backup_size_label(size_bytes):
 # Tabelle minime in vigore da maggio 2026 per il CCNL Turismo
 # Confcommercio - aziende alberghiere.
 CCNL_TURISMO_2026 = {
-    "Alberghi": {
+    "Albergo": {
         "Quadro A": 2491.82, "Quadro B": 2307.53, "1": 2084.71,
         "2": 1905.40, "3": 1797.04, "4": 1695.69, "5": 1590.27,
         "6S": 1529.13, "6": 1507.45, "7": 1412.60,
@@ -3102,7 +3102,8 @@ def payroll_report_html(inputs, result):
     rows = [
         ("Mansione", inputs.get("job_title", "")),
         ("Livello", inputs.get("level", "")),
-        ("Comparto", inputs.get("sector", "")),
+        ("CCNL", inputs.get("ccnl_name", "Turismo Confcommercio")),
+        ("Settore", inputs.get("sector", "")),
         ("Ore ordinarie", f"{inputs.get('ordinary_hours', 0):.2f}"),
         ("Minimo mensile utilizzato", euro_it(inputs.get("contractual_monthly", 0))),
         ("Lordo mensile stimato", euro_it(result["gross_month"])),
@@ -3133,7 +3134,7 @@ Non sostituisce il cedolino o il conteggio del consulente del lavoro.</div>
 def save_payroll_simulation(inputs, result):
     payload = {
         "job_title": inputs.get("job_title"),
-        "ccnl": "CCNL Turismo Confcommercio - aziende alberghiere",
+        "ccnl": inputs.get("ccnl_name", "Turismo Confcommercio"),
         "sector": inputs.get("sector"),
         "level": inputs.get("level"),
         "monthly_hours": float(inputs.get("ordinary_hours") or 0),
@@ -3404,7 +3405,7 @@ def system_health_snapshot():
         from rv_manager import __version__
         version_text = __version__
     except Exception:
-        version_text = "4.2.0"
+        version_text = "4.3.0"
 
     add_check(
         "Versione software",
@@ -3424,7 +3425,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 4.2 · Simulatore busta paga</div>
+            <div class="rv-brand-subtitle">Enterprise 4.3 · CCNL Turismo</div>
         </div>
     </div>
     """,
@@ -5480,10 +5481,10 @@ elif section == "Sicurezza e collaudo":
 
 
 elif section == "Simulazione busta paga":
-    st.title("Simulazione busta paga")
+    st.title("Simulazione busta paga – CCNL Turismo")
     st.caption(
         "Stima del netto mensile e del costo aziendale per il CCNL Turismo "
-        "Confcommercio – aziende alberghiere."
+        "Confcommercio. Seleziona il settore applicato all’azienda."
     )
     st.warning(
         "Il risultato è indicativo e non sostituisce l'elaborazione del "
@@ -5493,10 +5494,25 @@ elif section == "Simulazione busta paga":
 
     with st.form("simulatore_busta_paga"):
         st.subheader("Rapporto di lavoro")
-        r1, r2, r3 = st.columns(3)
-        sector = r1.selectbox("Comparto", list(CCNL_TURISMO_2026.keys()))
-        level = r2.selectbox("Livello", list(CCNL_TURISMO_2026[sector].keys()))
-        contract_type = r3.selectbox(
+        r1, r2, r3, r4 = st.columns(4)
+        ccnl_name = r1.text_input(
+            "CCNL",
+            value="Turismo Confcommercio",
+            disabled=True,
+        )
+        sector = r2.selectbox(
+            "Settore",
+            list(CCNL_TURISMO_2026.keys()),
+            help=(
+                "Il CCNL resta Turismo Confcommercio. "
+                "Qui si seleziona il settore retributivo applicabile."
+            ),
+        )
+        level = r3.selectbox(
+            "Livello",
+            list(CCNL_TURISMO_2026[sector].keys()),
+        )
+        contract_type = r4.selectbox(
             "Tipo di contratto",
             ["Tempo indeterminato", "Tempo determinato", "Apprendistato"],
         )
@@ -5597,6 +5613,7 @@ elif section == "Simulazione busta paga":
 
     if calculate:
         inputs = {
+            "ccnl_name": ccnl_name,
             "sector": sector,
             "level": level,
             "contract_type": contract_type,

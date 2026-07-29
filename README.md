@@ -464,3 +464,13 @@ modificabili, dettaglio dei calcoli, preventivo stampabile e
 salvataggio su Supabase.
 
 Questa distribuzione non contiene la cartella nascosta `.github`.
+
+
+## Enterprise 4.3 – CCNL Turismo
+
+Correzione dell'interfaccia del simulatore:
+
+- CCNL fisso: Turismo Confcommercio;
+- campo `Comparto` sostituito da `Settore`;
+- settori disponibili: Albergo e Alberghi minori;
+- nessuna nuova migrazione SQL richiesta.

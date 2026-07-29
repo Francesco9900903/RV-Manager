@@ -1,0 +1,13 @@
+{
+  "version": "4.3.0",
+  "feature": "CCNL Turismo Confcommercio con selezione Settore",
+  "changes": [
+    "CCNL mostrato come Turismo Confcommercio",
+    "Comparto rinominato in Settore",
+    "Settori disponibili: Albergo e Alberghi minori",
+    "Nessuna modifica SQL richiesta rispetto alla 4.2",
+    "Cartella .github non inclusa"
+  ],
+  "hidden_github_folder_included": false,
+  "new_sql_migration_required": false
+}

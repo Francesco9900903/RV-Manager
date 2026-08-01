@@ -2788,7 +2788,7 @@ def export_backup_manifest():
     manifest = {
         "generated_at": now_rome().isoformat(),
         "application": "RV Manager Enterprise",
-        "version": "4.3.0",
+        "version": "4.4.0",
         "tables": {},
     }
 
@@ -3405,7 +3405,7 @@ def system_health_snapshot():
         from rv_manager import __version__
         version_text = __version__
     except Exception:
-        version_text = "4.3.0"
+        version_text = "4.4.0"
 
     add_check(
         "Versione software",
@@ -3416,6 +3416,207 @@ def system_health_snapshot():
 
     return checks
 
+
+def enterprise_audit_snapshot():
+    checks = []
+
+    def add(area, name, ok, detail, weight=1):
+        checks.append({
+            "Area": area,
+            "Controllo": name,
+            "Stato": "SUPERATO" if ok else "DA RISOLVERE",
+            "Dettaglio": detail,
+            "Peso": int(weight),
+        })
+
+    # Applicazione e configurazione
+    env = runtime_environment_snapshot()
+    add(
+        "Configurazione",
+        "Ambiente dichiarato",
+        env["environment"] in {"production", "staging"},
+        f"Ambiente: {env['environment'].upper()}",
+        2,
+    )
+
+    try:
+        from rv_manager import __version__
+        app_version = __version__
+    except Exception:
+        app_version = "4.4.0"
+
+    add(
+        "Applicazione",
+        "Versione identificabile",
+        bool(app_version),
+        f"Versione installata: {app_version}",
+        1,
+    )
+
+    # Database e sicurezza
+    health = system_health_snapshot()
+    for row in health:
+        area_map = {
+            "Database": "Database",
+            "Sicurezza": "Sicurezza",
+            "Archiviazione": "Storage",
+            "Configurazione": "Configurazione",
+            "Continuità operativa": "Backup",
+            "Prestazioni": "Prestazioni",
+            "Applicazione": "Applicazione",
+        }
+        area = area_map.get(row.get("Categoria"), row.get("Categoria", "Sistema"))
+        add(
+            area,
+            row.get("Controllo", "Controllo sistema"),
+            row.get("Stato") == "OPERATIVO",
+            row.get("Dettaglio", ""),
+            3 if area in {"Sicurezza", "Database", "Backup"} else 2,
+        )
+
+    # Qualità dei dati
+    try:
+        employees = (
+            sb.table("employees")
+            .select("id,name,department,active")
+            .limit(10000)
+            .execute().data or []
+        )
+        active = [row for row in employees if row.get("active")]
+        incomplete = [
+            row for row in active
+            if not str(row.get("name") or "").strip()
+            or not str(row.get("department") or "").strip()
+        ]
+        add(
+            "Qualità dati",
+            "Anagrafiche dipendenti",
+            len(incomplete) == 0,
+            (
+                f"{len(active)} dipendenti attivi, nessuna anagrafica incompleta."
+                if not incomplete
+                else f"{len(incomplete)} anagrafiche attive richiedono completamento."
+            ),
+            2,
+        )
+    except Exception as exc:
+        add(
+            "Qualità dati",
+            "Anagrafiche dipendenti",
+            False,
+            safe_system_message(exc),
+            2,
+        )
+
+    try:
+        orphan_documents = (
+            sb.table("employee_documents")
+            .select("id,employee_id,title")
+            .is_("employee_id", "null")
+            .limit(100)
+            .execute().data or []
+        )
+        add(
+            "Qualità dati",
+            "Documenti associati",
+            len(orphan_documents) == 0,
+            (
+                "Tutti i documenti controllati risultano associati."
+                if not orphan_documents
+                else f"{len(orphan_documents)} documenti senza dipendente."
+            ),
+            3,
+        )
+    except Exception:
+        add(
+            "Qualità dati",
+            "Documenti associati",
+            False,
+            "Controllo non completato.",
+            2,
+        )
+
+    try:
+        orphan_payslips = (
+            sb.table("payslips")
+            .select("id,employee_id")
+            .is_("employee_id", "null")
+            .limit(100)
+            .execute().data or []
+        )
+        add(
+            "Qualità dati",
+            "Buste paga associate",
+            len(orphan_payslips) == 0,
+            (
+                "Tutte le buste paga controllate risultano associate."
+                if not orphan_payslips
+                else f"{len(orphan_payslips)} buste paga senza dipendente."
+            ),
+            3,
+        )
+    except Exception:
+        add(
+            "Qualità dati",
+            "Buste paga associate",
+            False,
+            "Controllo non completato.",
+            2,
+        )
+
+    # Funzioni fondamentali
+    required_features = [
+        ("Dipendenti", "Gestione dipendenti"),
+        ("Ore e approvazioni", "Gestione ore"),
+        ("Buste paga", "Buste paga"),
+        ("Centro documenti", "Documenti"),
+        ("Registro eventi", "Audit"),
+        ("Simulazione busta paga", "Simulazioni"),
+        ("Stato del sistema", "Diagnostica"),
+    ]
+    for menu_name, label in required_features:
+        add(
+            "Funzionalità",
+            label,
+            menu_name in MENU_ITEMS,
+            "Voce disponibile nel menu." if menu_name in MENU_ITEMS else "Voce non disponibile.",
+            1,
+        )
+
+    return checks
+
+
+def enterprise_scores(checks):
+    areas = {}
+    for row in checks:
+        area = row["Area"]
+        areas.setdefault(area, {"earned": 0, "possible": 0})
+        weight = int(row.get("Peso") or 1)
+        areas[area]["possible"] += weight
+        if row["Stato"] == "SUPERATO":
+            areas[area]["earned"] += weight
+
+    scores = {
+        area: round(values["earned"] / values["possible"] * 100)
+        if values["possible"] else 0
+        for area, values in areas.items()
+    }
+
+    earned = sum(values["earned"] for values in areas.values())
+    possible = sum(values["possible"] for values in areas.values())
+    overall = round(earned / possible * 100) if possible else 0
+    return scores, overall
+
+
+def readiness_label(score):
+    if score >= 95:
+        return "Pronto per il collaudo commerciale"
+    if score >= 85:
+        return "Quasi pronto"
+    if score >= 70:
+        return "In consolidamento"
+    return "Non pronto per la distribuzione"
+
 def health_status_icon(status):
     return "🟢" if status == "OPERATIVO" else "🟡"
 
@@ -3425,7 +3626,7 @@ st.sidebar.markdown(
         <div class="rv-brand-mark">RV</div>
         <div>
             <div class="rv-brand-title">RV Manager</div>
-            <div class="rv-brand-subtitle">Enterprise 4.3 · CCNL Turismo</div>
+            <div class="rv-brand-subtitle">Enterprise 4.4 · Centro Controllo</div>
         </div>
     </div>
     """,
@@ -3448,6 +3649,7 @@ MENU_ICONS = {
     "Centro notifiche": "●",
     "Sicurezza e collaudo": "⚿",
     "Stato del sistema": "◈",
+    "Centro Controllo Enterprise": "▦",
     "Fringe benefit": "◆",
     "Extra da regolarizzare": "△",
     "Dati del mese": "▦",
@@ -3469,6 +3671,7 @@ MENU_ITEMS = [
     "Centro notifiche",
     "Sicurezza e collaudo",
     "Stato del sistema",
+    "Centro Controllo Enterprise",
     "Fringe benefit",
     "Extra da regolarizzare",
     "Dati del mese",
@@ -5745,6 +5948,177 @@ elif section == "Simulazione busta paga":
                 )
                 with st.expander("Dettaglio tecnico"):
                     st.code(technical_error_text(exc))
+
+
+
+
+elif section == "Centro Controllo Enterprise":
+    st.title("Centro Controllo Enterprise")
+    st.caption(
+        "Audit tecnico e valutazione della preparazione di RV Manager "
+        "alla distribuzione commerciale."
+    )
+
+    if st.button(
+        "Esegui audit completo",
+        type="primary",
+        use_container_width=True,
+    ):
+        with st.spinner("Controllo del sistema in corso..."):
+            checks = enterprise_audit_snapshot()
+            scores, overall = enterprise_scores(checks)
+            st.session_state["enterprise_audit"] = {
+                "created_at": now_rome().isoformat(),
+                "checks": checks,
+                "scores": scores,
+                "overall": overall,
+            }
+
+    if "enterprise_audit" not in st.session_state:
+        checks = enterprise_audit_snapshot()
+        scores, overall = enterprise_scores(checks)
+        st.session_state["enterprise_audit"] = {
+            "created_at": now_rome().isoformat(),
+            "checks": checks,
+            "scores": scores,
+            "overall": overall,
+        }
+
+    audit_data = st.session_state["enterprise_audit"]
+    checks = audit_data["checks"]
+    scores = audit_data["scores"]
+    overall = audit_data["overall"]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Enterprise Readiness", f"{overall}%")
+    k2.metric(
+        "Controlli superati",
+        sum(1 for row in checks if row["Stato"] == "SUPERATO"),
+    )
+    k3.metric(
+        "Da risolvere",
+        sum(1 for row in checks if row["Stato"] != "SUPERATO"),
+    )
+    k4.metric(
+        "Ultimo audit",
+        format_datetime_it(audit_data["created_at"]),
+    )
+
+    if overall >= 95:
+        st.success(f"**{readiness_label(overall)}**")
+    elif overall >= 85:
+        st.warning(f"**{readiness_label(overall)}**")
+    else:
+        st.error(f"**{readiness_label(overall)}**")
+
+    st.subheader("Punteggi per area")
+    score_rows = [
+        {"Area": area, "Punteggio": score}
+        for area, score in sorted(scores.items())
+    ]
+    score_df = pd.DataFrame(score_rows)
+    st.dataframe(
+        score_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not score_df.empty:
+        chart_df = score_df.set_index("Area")
+        st.bar_chart(chart_df)
+
+    tab_summary, tab_issues, tab_all, tab_release = st.tabs(
+        [
+            "Riepilogo",
+            "Interventi richiesti",
+            "Tutti i controlli",
+            "Percorso LTS",
+        ]
+    )
+
+    with tab_summary:
+        area_groups = {}
+        for row in checks:
+            area_groups.setdefault(row["Area"], []).append(row)
+
+        for area, rows in sorted(area_groups.items()):
+            passed = sum(1 for row in rows if row["Stato"] == "SUPERATO")
+            with st.container(border=True):
+                st.markdown(f"**{area}**")
+                st.caption(f"{passed} controlli superati su {len(rows)}")
+
+    with tab_issues:
+        issues = [
+            row for row in checks
+            if row["Stato"] != "SUPERATO"
+        ]
+        if not issues:
+            st.success("Non risultano interventi tecnici aperti.")
+        else:
+            issue_df = pd.DataFrame(issues)[
+                ["Area", "Controllo", "Stato", "Dettaglio"]
+            ]
+            st.dataframe(
+                issue_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_all:
+        all_df = pd.DataFrame(checks)[
+            ["Area", "Controllo", "Stato", "Dettaglio"]
+        ]
+        st.dataframe(
+            all_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        audit_json = json.dumps(
+            {
+                "versione": "4.4.0",
+                "data": audit_data["created_at"],
+                "enterprise_readiness": overall,
+                "punteggi": scores,
+                "controlli": checks,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ).encode("utf-8")
+
+        st.download_button(
+            "Scarica report audit",
+            data=audit_json,
+            file_name=(
+                "enterprise_readiness_"
+                + now_rome().strftime("%Y%m%d_%H%M%S")
+                + ".json"
+            ),
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with tab_release:
+        st.markdown(
+            """
+            **Percorso per RV Manager Enterprise 2026 LTS**
+
+            1. Risolvere tutti i controlli ad alta priorità.
+            2. Eseguire il test con due account dipendente differenti.
+            3. Eseguire e verificare un backup.
+            4. Collaudare ogni pagina da desktop e smartphone.
+            5. Congelare il codice della versione candidata.
+            6. Creare il tag `2026-LTS-RC1`.
+            7. Eseguire un periodo pilota con dati controllati.
+            8. Pubblicare la versione LTS soltanto dopo il collaudo finale.
+            """
+        )
+
+        st.info(
+            "Il punteggio automatico è uno strumento interno. "
+            "Non costituisce una certificazione legale o di sicurezza."
+        )
 
 
 elif section == "Stato del sistema":
